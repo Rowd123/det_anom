@@ -1,0 +1,70 @@
+# Dataset
+dataset: PMU
+data_dir: /home/taklarid/Projects/code/fetch_pmu_data/out_openhistorian/Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-081000__50Hz.csv
+x_dim: null
+
+# Architecture
+use_connected_z_q: true
+use_connected_z_p: true
+
+# Paramètres du modèle
+z_dim: 3
+rnn_cell: GRU
+rnn_num_hidden: 500
+window_length: 100
+dense_dim: 500
+
+# Les normalizing flows ne sont pas encore réimplémentés.
+posterior_flow_type: null
+nf_layers: 20
+
+std_epsilon: 0.0001
+
+# Entraînement
+max_epoch: 2
+max_step: null
+train_start: 0
+max_train_size: 0.8
+batch_size: 50
+valid_batch_size: 50
+valid_step_freq: 100
+
+initial_lr: 0.001
+lr_anneal_factor: 0.5
+lr_anneal_epoch_freq: 40
+
+l2_reg: 0.0001
+gradient_clip_norm: 10.0
+
+early_stop: true
+early_stopping_patience: 20
+valid_portion: 0.3
+
+# Évaluation
+test_n_z: 1
+test_batch_size: 32
+max_test_size: null
+
+get_score_on_dim: false
+
+# Recherche du meilleur seuil
+bf_search_min: -400.0
+bf_search_max: 400.0
+bf_search_step_size: 1.0
+
+# POT
+level: 0.01
+pot_q: 0.001
+
+# Appareil
+device: null
+
+# Résultats et sauvegardes
+save_z: false
+save_dir: model
+restore_dir: null
+result_dir: result
+
+train_score_filename: train_score.pkl
+test_score_filename: test_score.pkl
+metrics_filename: metrics.json

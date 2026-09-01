@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from omni_anomaly.utils import BatchSlidingWindow
+from utils import BatchSlidingWindow
 
 
 class Predictor:

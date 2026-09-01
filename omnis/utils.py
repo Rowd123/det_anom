@@ -3,6 +3,390 @@ from collections.abc import Iterable, Iterator
 import torch
 from torch import Tensor
 
+import pickle
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+DATA_DIMENSIONS = {
+    "SMAP": 25,
+    "MSL": 55,
+    "PMU": 14
+}
+
+
+def notre_data_tri(data_file_path):
+
+    df = pd.read_csv(data_file_path, sep=";")
+
+    df["DATE_MESURE"] = pd.to_datetime(df["DATE_MESURE"])
+
+    df.set_index("DATE_MESURE", inplace=True)
+
+    flag_cols = [c for c in df.columns if c.endswith("QF")]
+
+    duplicated_mask = df.index.duplicated(keep="first")
+    flagged_df = df.loc[:, flag_cols].ne("NORMAL").any(axis=1).astype("bool")
+
+    excluded = (duplicated_mask  |
+                flagged_df |
+                df.isna().any(axis=1)
+                )
+
+    print(excluded.shape)
+
+    cols_to_drop = [col for col in df.columns if
+                    not col.endswith("MAG") and
+                    not col.endswith("FREQ") and
+                    not col.endswith("DFDT") and
+                    not col.endswith("ANG") ]
+
+    df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+
+    for col in df.columns:
+        if col.endswith("MAG"):
+            df.rename(columns={col: col[-6:]}, inplace=True)
+
+        else:
+            df.rename(columns={col: col[-4:]}, inplace=True)
+
+    return df.values, excluded
+
+
+def to_numpy(data) -> np.ndarray:
+    """
+    Convertit un Tenseur PyTorch ou un autre tableau
+    en numpy
+    """
+    if isinstance(data, Tensor):
+        return data.detach().cpu().numpy()
+    return np.asarray(data)
+
+def save_z(
+        z,
+        filename: str | Path = "z",
+        time_step: int = 20,
+) -> None:
+    """
+    Sauvegarde les représentations latentes dans des fichiers texte.
+
+    Forme attendue :
+        [nombre_de_fenêtre, window_length, latent_dim]
+
+    Un fichier est créé tous les 'time_step' instants, ainsi que pour
+    le dernier instant.
+    """
+    if time_step < 1:
+        raise ValueError(
+            "time_step doit être supérieur ou égal à 1"
+        )
+
+    z = to_numpy(z)
+
+    if z.ndim != 3:
+        raise ValueError(
+            "z doit avoir la forme "
+            "[nombre_de_fenêtres, window_length, latent_dim]"
+        )
+    filename = Path(filename)
+
+    filename.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    window_length = z.shape[1]
+
+    # Ajouter tous les multiples de time_step
+    time_indices = set(
+        range(0, window_length, time_step)
+    )
+
+    # Toujours ajouter le dernier instant
+    time_indices.add(window_length - 1)
+
+    for time_index in sorted(time_indices):
+        output_path = filename.parent / (
+            f"{filename.name}_{time_index}.txt"
+        )
+
+        # z[:, time_index; :] :
+        # [nombre_de_fenêtre, latent_dim]
+        np.savetxt(
+            output_path,
+            z[:, time_index, :],
+            fmt="%.6f",
+        )
+
+def get_data_dim(dataset: str) -> int:
+    """
+    Retourne le nombre de variables du dataset.
+    """
+    if dataset in DATA_DIMENSIONS:
+        return DATA_DIMENSIONS[dataset]
+
+    if dataset.startswith("machine"):
+        return 38
+
+    raise ValueError(
+        f"Dataset inconnu : {dataset}"
+    )
+
+def load_pickle(
+    path: Path,
+    required: bool = True,
+):
+    """
+    Charge un fichier Pickle.
+
+    Attention : ne charger que des fichiers Pickle fiables.
+    """
+    if not path.is_file():
+        if required:
+            raise FileNotFoundError(
+                f"Fichier introuvable : {path}"
+            )
+
+        return None
+
+    with path.open("rb") as file:
+        return pickle.load(file)
+
+
+def get_data(
+    dataset: str,
+    data_directory: str | Path,
+    max_train_size: Optional[float] = None,
+    max_test_size: Optional[int] = None,
+    print_log: bool = True,
+    do_preprocess: bool = True,
+    train_start: int = 0,
+):
+    """
+    Charge les données d'entraînement et de test.
+
+    Retour
+    ------
+    (
+        (train_data, train_label, train_excludes),
+        (test_data, test_label, test_excludes),
+    )
+
+    Les données ont la forme :
+        [nombre_de_points, x_dim]
+
+    Les masques excludes ont la forme :
+        [nombre_de_points]
+    """
+    if train_start < 0 :
+        raise ValueError(
+            "train_start et test_start doivent être positifs ou nuls"
+        )
+
+    if max_train_size is not None and max_train_size <= 0:
+        raise ValueError(
+            "max_train_size doit être positif ou None"
+        )
+
+    if max_test_size is not None and max_test_size < 1:
+        raise ValueError(
+            "max_test_size doit être positif ou None"
+        )
+
+    DATA, excluded = notre_data_tri(data_directory)
+
+    x_dim = get_data_dim(dataset)
+
+    max_train_size = int(DATA.shape[0] * max_train_size)
+
+    train_end = (
+        None
+        if max_train_size is None
+        else train_start + max_train_size
+    )
+
+    test_start = train_start + max_train_size
+
+    test_end = (
+        None
+        if max_test_size is None
+        else test_start + max_test_size
+    )
+
+    if print_log:
+        print(f"Chargement du dataset : {dataset}")
+        print(f"Train : [{train_start}:{train_end}]")
+        print(f"Test  : [{test_start}:{test_end}]")
+
+    train_data = DATA[train_start:train_end]
+    train_exclude = excluded[train_start:train_end]
+    test_data = DATA[test_start:test_end]
+    test_exclude = excluded[test_start:test_end]
+    test_label = None
+
+    # ------------------------------------------------------------
+    # Entraînement
+    # ------------------------------------------------------------
+    """
+    train_path = (
+        data_directory
+        / f"{dataset}_train.pkl"
+    )
+
+    train_data = load_pickle(
+        train_path,
+        required=True,
+    )
+
+    train_data = np.asarray(
+        train_data,
+        dtype=np.float32,
+    ).reshape(-1, x_dim)
+
+    train_data = train_data[
+        train_start:train_end
+    ]
+
+    # ------------------------------------------------------------
+    # Test
+    # ------------------------------------------------------------
+
+    test_path = (
+        data_directory
+        / f"{dataset}_test.pkl"
+    )
+
+    test_data = load_pickle(
+        test_path,
+        required=False,
+    )
+
+    if test_data is not None:
+        test_data = np.asarray(
+            test_data,
+            dtype=np.float32,
+        ).reshape(-1, x_dim)
+
+        test_data = test_data[
+            test_start:test_end
+        ]
+
+    # ------------------------------------------------------------
+    # Labels
+    # ------------------------------------------------------------
+
+    test_label_path = (
+        data_directory
+        / f"{dataset}_test_label.pkl"
+    )
+
+    test_label = load_pickle(
+        test_label_path,
+        required=False,
+    )
+
+    if test_label is not None:
+        test_label = np.asarray(
+            test_label,
+        ).reshape(-1)
+
+        test_label = test_label[
+            test_start:test_end
+        ]
+
+        test_label = torch.as_tensor(
+            test_label,
+            dtype=torch.bool,
+        )
+    
+    """
+
+    # ------------------------------------------------------------
+    # Prétraitement
+    # ------------------------------------------------------------
+
+    if do_preprocess:
+        train_data = preprocess(
+            train_data,
+        )
+
+        if test_data is not None:
+            test_data = preprocess(
+                test_data,
+            )
+        else:
+            test_exclude = None
+
+    else:
+        train_data = torch.as_tensor(
+            train_data,
+            dtype=torch.float32,
+        )
+
+        train_exclude = torch.zeros(
+            len(train_data),
+            dtype=torch.bool,
+        )
+
+        if test_data is not None:
+            test_data = torch.as_tensor(
+                test_data,
+                dtype=torch.float32,
+            )
+
+            test_exclude = torch.zeros(
+                len(test_data),
+                dtype=torch.bool,
+            )
+        else:
+            test_exclude = None
+
+    if print_log:
+        print(
+            "Train shape :",
+            tuple(train_data.shape),
+        )
+
+        print(
+            "Test shape :",
+            (
+                tuple(test_data.shape)
+                if test_data is not None
+                else None
+            ),
+        )
+
+        print(
+            "Labels shape :",
+            (
+                tuple(test_label.shape)
+                if test_label is not None
+                else None
+            ),
+        )
+
+        print(
+            "Fenêtres exclues du train :",
+            int(train_exclude.sum()),
+        )
+
+        if test_exclude is not None:
+            print(
+                "Fenêtres exclues du test :",
+                int(test_exclude.sum()),
+            )
+
+    return (
+        train_data,
+        None,
+        train_exclude,
+    ), (
+        test_data,
+        test_label,
+        test_exclude,
+    )
 
 def preprocess(data) -> Tensor:
     """

@@ -9,7 +9,7 @@ import pyro
 import torch
 from torch import Tensor, nn
 
-from omni_anomaly.utils import BatchSlidingWindow
+from utils import BatchSlidingWindow
 
 
 class Trainer:
