@@ -240,3 +240,16 @@ class RecurrentDistribution(TorchDistribution):
 
         # Somme sur le temps.
         return torch.stack(log_probs, dim=-1).sum(dim=-1)
+
+    def scale_statistics(self, value: Tensor) -> Tensor:
+        """Retourne tous les écarts-types conditionnels évalués sur ``value``."""
+        z_previous = value.new_zeros(value.shape[:-2] + (self.z_dim,))
+        scales = []
+        for time_index in range(self.window_length):
+            _, scale_t = self._parameters(
+                self.input_q[:, time_index, :],
+                z_previous,
+            )
+            scales.append(scale_t)
+            z_previous = value[..., time_index, :]
+        return torch.stack(scales, dim=-2)
