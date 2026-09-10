@@ -1,6 +1,7 @@
 # trainer.py
 
 from copy import deepcopy
+from collections import deque
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -9,7 +10,7 @@ import pyro
 import torch
 from torch import Tensor, nn
 
-from utils import BatchSlidingWindow
+from utils import BatchSlidingWindow, MinMaxScaler
 
 
 class Trainer:
@@ -34,8 +35,8 @@ class Trainer:
         weight_decay: Régularisation appliquée aux poids
         grad_clip_norm: Limite la norme totale des gradients pour éviter leur explosion
         check_numerics: Vérifie que la perte et les gradients ne contiennent pas de NaN ou d'infinis
-        early_stopping_patience: Arrête l'entraînement si la perte de validation ne s'améliore pas pendant
-                                le nombre assingé
+        early_stopping_validation_patience: Nombre de contrôles de validation
+                                            consécutifs sans amélioration
         device: où exécuter les calculs (cude - cpu)
 
 
@@ -44,7 +45,8 @@ class Trainer:
     def __init__(
         self,
         model: nn.Module,
-        n_z: int = 1,
+        train_n_z: int = 1,
+        valid_n_z: int = 8,
         max_epoch: Optional[int] = 256,
         max_step: Optional[int] = None,
         batch_size: int = 256,
@@ -58,7 +60,13 @@ class Trainer:
         grad_clip_norm: Optional[float] = 50.0,
         check_numerics: bool = True,
         weight_decay: float = 0.0,
-        early_stopping_patience: int = 20,
+        early_stopping_validation_patience: int = 20,
+        anomaly_filter_enabled: bool = True,
+        anomaly_filter_warmup_epochs: int = 2,
+        anomaly_filter_k: float = 5.0,
+        anomaly_filter_history_size: int = 10000,
+        anomaly_filter_min_history: int = 1000,
+        anomaly_filter_max_fraction: float = 0.10,
         device: Optional[str | torch.device] = None,
     ):
         if max_epoch is None and max_step is None:
@@ -66,16 +74,27 @@ class Trainer:
                 "max_epoch ou max_step doit être défini"
             )
 
-        if n_z < 1:
-            raise ValueError("n_z doit être supérieur ou égal à 1")
+        if train_n_z < 1 or valid_n_z < 1:
+            raise ValueError("train_n_z et valid_n_z doivent être positifs")
 
         if batch_size < 1 or valid_batch_size < 1:
             raise ValueError(
                 "Les tailles de batch doivent être positives"
             )
 
+        if valid_step_freq < 1:
+            raise ValueError(
+                "valid_step_freq doit être supérieur ou égal à 1"
+            )
+
         self._model = model
-        self._n_z = n_z
+        if anomaly_filter_history_size < 1:
+            raise ValueError("anomaly_filter_history_size doit être positif")
+        if not 0.0 <= anomaly_filter_max_fraction < 1.0:
+            raise ValueError("anomaly_filter_max_fraction doit être dans [0, 1[")
+
+        self._train_n_z = train_n_z
+        self._valid_n_z = valid_n_z
         self._max_epoch = max_epoch
         self._max_step = max_step
         self._batch_size = batch_size
@@ -83,7 +102,17 @@ class Trainer:
         self._valid_step_freq = valid_step_freq
         self._grad_clip_norm = grad_clip_norm
         self._check_numerics = check_numerics
-        self._early_stopping_patience = early_stopping_patience
+        self._early_stopping_validation_patience = (
+            early_stopping_validation_patience
+        )
+        self._anomaly_filter_enabled = anomaly_filter_enabled
+        self._anomaly_filter_warmup_epochs = anomaly_filter_warmup_epochs
+        self._anomaly_filter_k = anomaly_filter_k
+        self._anomaly_filter_min_history = anomaly_filter_min_history
+        self._anomaly_filter_max_fraction = anomaly_filter_max_fraction
+        self._loss_history = deque(maxlen=anomaly_filter_history_size)
+        self._recent_batch_losses = deque(maxlen=100)
+        self.scaler = MinMaxScaler()
 
         if device is None:
             device = (
@@ -120,6 +149,7 @@ class Trainer:
             self._scheduler = None
 
         self._global_step = 0
+        self._epoch = 0
 
     @property
     def model(self) -> nn.Module:
@@ -130,9 +160,9 @@ class Trainer:
         return self._global_step
 
     def _check_loss(self, loss: Tensor) -> None:
-        if self._check_numerics and not torch.isfinite(loss):
+        if self._check_numerics and not torch.isfinite(loss).all():
             raise FloatingPointError(
-                f"La perte n'est pas finie : {loss.item()}"
+                "La perte contient des NaN ou des infinis"
             )
 
     def _check_gradients(self) -> None:
@@ -148,7 +178,24 @@ class Trainer:
                     f"Le gradient de {name} contient des NaN ou infinis"
                 )
 
-    def _training_step(self, batch_x: Tensor) -> float:
+    @staticmethod
+    def _tensor_stats(values: Tensor) -> tuple[float, float, float]:
+        values = values.detach()
+        return (
+            values.min().item(),
+            values.median().item(),
+            values.max().item(),
+        )
+
+    def _gradient_norm(self) -> float:
+        squared_norm = sum(
+            parameter.grad.detach().norm(2).item() ** 2
+            for parameter in self._model.parameters()
+            if parameter.grad is not None
+        )
+        return squared_norm ** 0.5
+
+    def _training_step(self, batch_x: Tensor, epoch: int) -> dict:
         self._model.train()
 
         batch_x = batch_x.to(
@@ -158,29 +205,83 @@ class Trainer:
 
         self._optimizer.zero_grad(set_to_none=True)
 
-        loss = self._model.get_training_loss(
+        components = self._model.get_per_window_loss(
             x=batch_x,
-            n_z=self._n_z,
+            n_z=self._train_n_z,
         )
+        per_window_losses = components["loss"]
+        self._check_loss(per_window_losses)
+
+        detached_losses = per_window_losses.detach()
+        threshold = None
+        filter_status = "disabled"
+        accepted_mask = torch.ones_like(per_window_losses, dtype=torch.bool)
+
+        if self._anomaly_filter_enabled:
+            if epoch <= self._anomaly_filter_warmup_epochs:
+                filter_status = "warm-up"
+            elif len(self._loss_history) < self._anomaly_filter_min_history:
+                filter_status = "insufficient-history"
+            else:
+                history = torch.tensor(
+                    list(self._loss_history),
+                    device=per_window_losses.device,
+                )
+                median = history.median()
+                mad = (history - median).abs().median()
+                threshold_tensor = median + self._anomaly_filter_k * 1.4826 * mad
+                threshold = threshold_tensor.item()
+                rejected = detached_losses > threshold_tensor
+                max_rejected = min(
+                    int(len(batch_x) * self._anomaly_filter_max_fraction),
+                    len(batch_x) - 1,
+                )
+                if rejected.sum().item() > max_rejected:
+                    rejected = torch.zeros_like(rejected)
+                    if max_rejected:
+                        highest = torch.topk(detached_losses, max_rejected).indices
+                        rejected[highest] = True
+                accepted_mask = ~rejected
+                filter_status = "active"
+
+        loss = per_window_losses[accepted_mask].mean()
 
         self._check_loss(loss)
-
-        loss /= len(batch_x)
-
         loss.backward()
 
         self._check_gradients()
+        gradient_norm_before = self._gradient_norm()
 
         if self._grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 self._model.parameters(),
                 max_norm=self._grad_clip_norm,
             )
+        gradient_norm_after = self._gradient_norm()
 
         self._optimizer.step()
         self._global_step += 1
 
-        return loss.detach().item()
+        history_values = detached_losses[accepted_mask]
+        self._loss_history.extend(history_values.cpu().tolist())
+        batch_loss = detached_losses.mean().item()
+        self._recent_batch_losses.append(batch_loss)
+        rejected_windows = (~accepted_mask).sum().item()
+        return {
+            "batch_loss_mean": batch_loss,
+            "filtered_loss": loss.detach().item(),
+            "nll": components["nll"].detach().mean().item(),
+            "kl": components["kl"].detach().mean().item(),
+            "decoder_scale": self._tensor_stats(components["decoder_scale"]),
+            "posterior_scale": self._tensor_stats(components["posterior_scale"]),
+            "gradient_norm_before": gradient_norm_before,
+            "gradient_norm_after": gradient_norm_after,
+            "threshold": threshold,
+            "filter_status": filter_status,
+            "rejected_windows": rejected_windows,
+            "total_windows": len(batch_x),
+            "recent_loss": sum(self._recent_batch_losses) / len(self._recent_batch_losses),
+        }
 
     @torch.no_grad()
     def _validation_loss(
@@ -201,14 +302,14 @@ class Trainer:
                 dtype=torch.float32,
             )
 
-            loss = self._model.get_training_loss(
+            per_window_losses = self._model.get_per_window_loss(
                 x=batch_x,
-                n_z=self._n_z,
-            )
+                n_z=self._valid_n_z,
+            )["loss"]
 
-            self._check_loss(loss)
+            self._check_loss(per_window_losses)
 
-            total_loss += loss.item()
+            total_loss += per_window_losses.sum().item()
             total_observations += len(batch_x)
 
         if total_observations == 0:
@@ -278,11 +379,18 @@ class Trainer:
             )
 
         if excludes is None:
-            train_excludes = None
-            valid_excludes = None
+            train_excludes = torch.zeros(len(train_values), dtype=torch.bool)
+            valid_excludes = torch.zeros(len(valid_values), dtype=torch.bool)
         else:
             train_excludes = excludes[:split_index]
             valid_excludes = excludes[split_index:]
+
+        # Le split est fait sur les données physiques brutes. Le scaler ne voit
+        # que la partie entraînement et ignore les lignes exclues/non finies.
+        if not self.scaler.fitted:
+            self.scaler.fit(train_values, train_excludes)
+        train_values = self.scaler.transform(train_values)
+        valid_values = self.scaler.transform(valid_values)
 
         train_sliding_window = BatchSlidingWindow(
             array_size=len(train_values),
@@ -312,16 +420,17 @@ class Trainer:
 
         best_valid_loss = float("inf")
         best_model_state = None
-        epochs_without_improvement = 0
+        validation_checks_without_improvement = 0
 
         train_batch_times = []
         valid_batch_times = []
 
-        epoch = 0
+        epoch = self._epoch
         should_stop = False
 
         while not should_stop:
             epoch += 1
+            self._epoch = epoch
 
             if self._max_epoch is not None and epoch > self._max_epoch:
                 break
@@ -336,13 +445,13 @@ class Trainer:
             for (batch_x,) in train_iterator:
                 batch_start = perf_counter()
 
-                loss = self._training_step(batch_x)
+                step_metrics = self._training_step(batch_x, epoch)
 
                 train_batch_times.append(
                     perf_counter() - batch_start
                 )
 
-                epoch_loss += loss
+                epoch_loss += step_metrics["batch_loss_mean"] * len(batch_x)
                 epoch_observations += len(batch_x)
 
                 if (
@@ -359,12 +468,29 @@ class Trainer:
                         perf_counter() - validation_start
                     )
 
+                    decoder_scale = step_metrics["decoder_scale"]
+                    posterior_scale = step_metrics["posterior_scale"]
+                    rejected = step_metrics["rejected_windows"]
+                    total = step_metrics["total_windows"]
                     print(
                         f"Epoch {epoch:03d} | "
                         f"step {self._global_step:06d} | "
-                        f"train_loss "
-                        f"{epoch_loss / epoch_observations:.6f} | "
-                        f"valid_loss {valid_loss:.6f}"
+                        f"batch_loss_mean {step_metrics['batch_loss_mean']:.6f} | "
+                        f"filtered_loss {step_metrics['filtered_loss']:.6f} | "
+                        f"recent_loss {step_metrics['recent_loss']:.6f} | "
+                        f"train_loss {epoch_loss / epoch_observations:.6f} | "
+                        f"valid_loss {valid_loss:.6f} | "
+                        f"nll {step_metrics['nll']:.6f} | kl {step_metrics['kl']:.6f} | "
+                        f"threshold {step_metrics['threshold']} | "
+                        f"filter {step_metrics['filter_status']} | "
+                        f"rejected {rejected}/{total} ({rejected / total:.2%}) | "
+                        f"history_size {len(self._loss_history)} | "
+                        f"decoder_scale[min/median/max] {decoder_scale} | "
+                        f"posterior_scale[min/median/max] {posterior_scale} | "
+                        f"grad_norm[before/after] "
+                        f"{step_metrics['gradient_norm_before']:.6f}/"
+                        f"{step_metrics['gradient_norm_after']:.6f} | "
+                        f"lr {self._optimizer.param_groups[0]['lr']:.8f}"
                     )
 
                     if valid_loss < best_valid_loss:
@@ -374,16 +500,16 @@ class Trainer:
                             self._model.state_dict()
                         )
 
-                        epochs_without_improvement = 0
+                        validation_checks_without_improvement = 0
 
                         if checkpoint_path is not None:
                             self.save_checkpoint(checkpoint_path)
                     else:
-                        epochs_without_improvement += 1
+                        validation_checks_without_improvement += 1
 
                     if (
-                        epochs_without_improvement
-                        >= self._early_stopping_patience
+                        validation_checks_without_improvement
+                        >= self._early_stopping_validation_patience
                     ):
                         print("Arrêt anticipé")
                         should_stop = True
@@ -409,7 +535,12 @@ class Trainer:
                     )
 
         if best_model_state is not None:
-            self._model.load_state_dict(best_model_state)
+            if checkpoint_path is not None and Path(checkpoint_path).is_file():
+                # Restaure ensemble modèle, optimiseur, scheduler, compteur et
+                # scaler afin que le checkpoint final reste reprenable.
+                self.load_checkpoint(checkpoint_path)
+            else:
+                self._model.load_state_dict(best_model_state)
 
         mean_train_time = (
             sum(train_batch_times) / len(train_batch_times)
@@ -446,6 +577,9 @@ class Trainer:
                     else None
                 ),
                 "global_step": self._global_step,
+                "epoch": self._epoch,
+                "scaler_state_dict": self.scaler.state_dict(),
+                "loss_history": list(self._loss_history),
             },
             path,
         )
@@ -459,6 +593,12 @@ class Trainer:
             map_location=self._device,
             weights_only=True,
         )
+
+        if "scaler_state_dict" not in checkpoint:
+            raise ValueError(
+                "Ce checkpoint ancien ne contient pas le scaler requis pour "
+                "une reprise ou une inférence sûre"
+            )
 
         self._model.load_state_dict(
             checkpoint["model_state_dict"]
@@ -475,3 +615,9 @@ class Trainer:
             self._scheduler.load_state_dict(
                 checkpoint["scheduler_state_dict"]
             )
+
+        self._global_step = checkpoint["global_step"]
+        self._epoch = checkpoint.get("epoch", 0)
+        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        self._loss_history.clear()
+        self._loss_history.extend(checkpoint.get("loss_history", []))
