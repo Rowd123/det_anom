@@ -367,7 +367,14 @@ class Trainer:
         return ranks
 
     def _window_diagnostics(self, components: dict[str, Tensor]) -> dict:
-        if "decoder_scale_mean" in components:
+        if all(
+            name in components
+            for name in (
+                "decoder_scale_mean",
+                "decoder_scale_min",
+                "decoder_scale_median",
+            )
+        ):
             per_window_scale_mean = components["decoder_scale_mean"].detach()
             per_window_scale_min = components["decoder_scale_min"].detach()
             per_window_scale_median = components["decoder_scale_median"].detach()
