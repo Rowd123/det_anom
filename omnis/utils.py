@@ -37,37 +37,53 @@ class FeatureRepresentation:
     phasors: tuple[PhasorFeatureMapping, ...]
 
 
-def _feature_stem(name: str, suffix: str) -> str:
-    return name[:-len(suffix)].rstrip(" _.-")
+PMU_FIRST_PHASOR_INDEX = 2
 
 
 def _readable_feature_name(name: str) -> str:
     return name.strip().replace(" ", "_").lower()
 
 
+def _phasor_name(amplitude_name: str, phase_name: str) -> str:
+    """Produit un nom lisible sans utiliser les noms pour décider des couples."""
+    if amplitude_name.endswith("MAG"):
+        return amplitude_name[:-len("MAG")].rstrip(" _.-")
+
+    common_length = 0
+    for amplitude_character, phase_character in zip(amplitude_name, phase_name):
+        if amplitude_character != phase_character:
+            break
+        common_length += 1
+    common_name = amplitude_name[:common_length].rstrip(" _.-")
+    return common_name or amplitude_name
+
+
 def build_feature_representation(column_names) -> FeatureRepresentation:
-    """Déduit les couples MAG/ANG de leurs noms complets, jamais d'un indice."""
+    """Décrit tous les couples PMU (2, 3), (4, 5), ..., dans l'ordre du CSV."""
     original_names = tuple(str(name) for name in column_names)
-    amplitudes = {
-        _feature_stem(name, "MAG"): index
-        for index, name in enumerate(original_names)
-        if name.endswith("MAG")
-    }
-    phases = {
-        _feature_stem(name, "ANG"): index
-        for index, name in enumerate(original_names)
-        if name.endswith("ANG")
-    }
+    phasor_feature_count = len(original_names) - PMU_FIRST_PHASOR_INDEX
+    if phasor_feature_count < 0 or phasor_feature_count % 2:
+        raise ValueError(
+            "Les variables PMU à partir de l'indice 2 doivent former des "
+            "couples amplitude/phase"
+        )
+
     model_names = [_readable_feature_name(name) for name in original_names]
     phasors = []
-    for stem, amplitude_index in amplitudes.items():
-        phase_index = phases.get(stem)
-        if phase_index is None:
-            continue
-        readable_stem = _readable_feature_name(stem)
+    for amplitude_index in range(
+        PMU_FIRST_PHASOR_INDEX,
+        len(original_names),
+        2,
+    ):
+        phase_index = amplitude_index + 1
+        amplitude_name = original_names[amplitude_index]
+        phase_name = original_names[phase_index]
+        readable_stem = _readable_feature_name(
+            _phasor_name(amplitude_name, phase_name)
+        )
         mapping = PhasorFeatureMapping(
-            amplitude_name=original_names[amplitude_index],
-            phase_name=original_names[phase_index],
+            amplitude_name=amplitude_name,
+            phase_name=phase_name,
             real_name=f"{readable_stem}_real",
             imag_name=f"{readable_stem}_imag",
             amplitude_index=amplitude_index,
