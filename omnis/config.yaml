@@ -19,6 +19,8 @@ posterior_flow_type: null
 nf_layers: 20
 
 std_epsilon: 0.0001
+decoder_scale_mode: learned  # learned ou fixed
+decoder_fixed_scale: 0.05
 
 # Entraînement
 run_mode: scratch  # scratch, resume ou evaluate
@@ -46,7 +48,7 @@ lr_anneal_factor: 0.5
 lr_anneal_epoch_freq: 10
 
 l2_reg: 0.0001
-gradient_clip_norm: 10.0
+gradient_clip_norm: 50.0
 
 early_stop: true
 # Nombre de contrôles de validation sans amélioration (pas des époques)

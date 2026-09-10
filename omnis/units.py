@@ -148,6 +148,38 @@ class DistributionParameterNetwork(nn.Module):
         }
 
 
+class FixedScaleDistributionParameterNetwork(nn.Module):
+    """Produit une moyenne apprise et un écart-type constant non apprenable."""
+
+    def __init__(
+        self,
+        hidden_network: nn.Module,
+        hidden_dim: int,
+        output_dim: int,
+        fixed_scale: float,
+    ):
+        super().__init__()
+
+        if fixed_scale <= 0:
+            raise ValueError("fixed_scale doit être strictement positif")
+
+        self.hidden_network = hidden_network
+        self.mean_layer = nn.Linear(hidden_dim, output_dim)
+        self.register_buffer(
+            "_fixed_scale",
+            torch.tensor(float(fixed_scale)),
+        )
+
+    def forward(self, inputs: Tensor) -> dict[str, Tensor]:
+        hidden = self.hidden_network(inputs)
+        loc = self.mean_layer(hidden)
+
+        return {
+            "loc": loc,
+            "scale": self._fixed_scale.expand_as(loc),
+        }
+
+
 class RecurrentPosteriorInputNetwork(nn.Module):
     """
     Le RNN produit input_q, utilisé ensuite par RecurrentDistribution.
