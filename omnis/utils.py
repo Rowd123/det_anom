@@ -34,7 +34,11 @@ class MinMaxScaler:
             raise ValueError("data doit avoir la forme [temps, variables]")
         valid_rows = torch.isfinite(data).all(dim=1)
         if excludes is not None:
-            excludes = torch.as_tensor(np.asarray(excludes), dtype=torch.bool)
+            excludes = torch.as_tensor(
+                np.asarray(excludes),
+                dtype=torch.bool,
+                device=data.device,
+            )
             if excludes.shape != (len(data),):
                 raise ValueError(f"excludes doit avoir la forme ({len(data)},)")
             valid_rows &= ~excludes
@@ -48,25 +52,48 @@ class MinMaxScaler:
     def transform(self, data) -> Tensor:
         self._check_fitted()
         data = torch.as_tensor(data, dtype=torch.float32)
-        difference = self.maximum - self.minimum
+        minimum, maximum = self._parameters_for(data)
+        difference = maximum - minimum
         scale = torch.where(difference > 0, difference, torch.ones_like(difference))
-        return torch.nan_to_num((data - self.minimum) / scale)
+        return torch.nan_to_num((data - minimum) / scale)
 
     def inverse_transform(self, data) -> Tensor:
         self._check_fitted()
         data = torch.as_tensor(data, dtype=torch.float32)
-        difference = self.maximum - self.minimum
+        minimum, maximum = self._parameters_for(data)
+        difference = maximum - minimum
         scale = torch.where(difference > 0, difference, torch.ones_like(difference))
-        return data * scale + self.minimum
+        return data * scale + minimum
 
     def state_dict(self) -> dict[str, Tensor]:
         self._check_fitted()
-        return {"minimum": self.minimum.clone(), "maximum": self.maximum.clone()}
+        return {
+            "minimum": self.minimum.detach().cpu().clone(),
+            "maximum": self.maximum.detach().cpu().clone(),
+        }
 
     def load_state_dict(self, state: dict[str, Tensor]):
-        self.minimum = torch.as_tensor(state["minimum"], dtype=torch.float32)
-        self.maximum = torch.as_tensor(state["maximum"], dtype=torch.float32)
+        # Le scaler reste sur CPU dans le checkpoint. transform() déplace ses
+        # paramètres vers le device de l'entrée au moment de leur utilisation.
+        self.minimum = torch.as_tensor(
+            state["minimum"], dtype=torch.float32, device="cpu"
+        )
+        self.maximum = torch.as_tensor(
+            state["maximum"], dtype=torch.float32, device="cpu"
+        )
         return self
+
+    def _parameters_for(self, data: Tensor) -> tuple[Tensor, Tensor]:
+        if data.ndim < 1 or data.shape[-1] != self.minimum.shape[-1]:
+            raise ValueError(
+                "La dernière dimension des données ne correspond pas au scaler : "
+                f"{data.shape[-1] if data.ndim else None} reçu, "
+                f"{self.minimum.shape[-1]} attendu"
+            )
+        return (
+            self.minimum.to(device=data.device, dtype=data.dtype),
+            self.maximum.to(device=data.device, dtype=data.dtype),
+        )
 
     def _check_fitted(self) -> None:
         if not self.fitted:
