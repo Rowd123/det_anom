@@ -18,7 +18,6 @@ DATA_DIMENSIONS = {
 
 
 def notre_data_tri(data_file_path):
-
     df = pd.read_csv(data_file_path, sep=";")
 
     df["DATE_MESURE"] = pd.to_datetime(df["DATE_MESURE"])
@@ -30,7 +29,7 @@ def notre_data_tri(data_file_path):
     duplicated_mask = df.index.duplicated(keep="first")
     flagged_df = df.loc[:, flag_cols].ne("NORMAL").any(axis=1).astype("bool")
 
-    excluded = (duplicated_mask  |
+    excluded = (duplicated_mask |
                 flagged_df |
                 df.isna().any(axis=1)
                 )
@@ -41,12 +40,12 @@ def notre_data_tri(data_file_path):
                     not col.endswith("MAG") and
                     not col.endswith("FREQ") and
                     not col.endswith("DFDT") and
-                    not col.endswith("ANG") ]
+                    not col.endswith("ANG")]
 
     df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
 
     for col in df.columns:
-        if col.endswith("MAG"):
+        if col.endswith("MAG") or not col.endswith("ANG"):
             df.rename(columns={col: col[-6:]}, inplace=True)
 
         else:
@@ -63,6 +62,7 @@ def to_numpy(data) -> np.ndarray:
     if isinstance(data, Tensor):
         return data.detach().cpu().numpy()
     return np.asarray(data)
+
 
 def save_z(
         z,
@@ -120,6 +120,7 @@ def save_z(
             fmt="%.6f",
         )
 
+
 def get_data_dim(dataset: str) -> int:
     """
     Retourne le nombre de variables du dataset.
@@ -134,9 +135,10 @@ def get_data_dim(dataset: str) -> int:
         f"Dataset inconnu : {dataset}"
     )
 
+
 def load_pickle(
-    path: Path,
-    required: bool = True,
+        path: Path,
+        required: bool = True,
 ):
     """
     Charge un fichier Pickle.
@@ -156,13 +158,13 @@ def load_pickle(
 
 
 def get_data(
-    dataset: str,
-    data_directory: str | Path,
-    max_train_size: Optional[float] = None,
-    max_test_size: Optional[int] = None,
-    print_log: bool = True,
-    do_preprocess: bool = True,
-    train_start: int = 0,
+        dataset: str,
+        data_directory: str | Path,
+        max_train_size: Optional[float] = None,
+        max_test_size: Optional[int] = None,
+        print_log: bool = True,
+        do_preprocess: bool = True,
+        train_start: int = 0,
 ):
     """
     Charge les données d'entraînement et de test.
@@ -180,7 +182,7 @@ def get_data(
     Les masques excludes ont la forme :
         [nombre_de_points]
     """
-    if train_start < 0 :
+    if train_start < 0:
         raise ValueError(
             "train_start et test_start doivent être positifs ou nuls"
         )
@@ -300,7 +302,7 @@ def get_data(
             test_label,
             dtype=torch.bool,
         )
-    
+
     """
 
     # ------------------------------------------------------------
@@ -388,6 +390,7 @@ def get_data(
         test_exclude,
     )
 
+
 def preprocess(data) -> Tensor:
     """
     Convertit les données en float32, remplace les NaN,
@@ -436,9 +439,9 @@ def preprocess(data) -> Tensor:
 
 
 def minibatch_slices_iterator(
-    length: int,
-    batch_size: int,
-    ignore_incomplete_batch: bool = False,
+        length: int,
+        batch_size: int,
+        ignore_incomplete_batch: bool = False,
 ) -> Iterator[slice]:
     """
     Produit les slices correspondant aux mini-batchs.
@@ -473,13 +476,13 @@ class BatchSlidingWindow:
     """
 
     def __init__(
-        self,
-        array_size: int,
-        window_size: int,
-        batch_size: int,
-        excludes: Tensor | None = None,
-        shuffle: bool = False,
-        ignore_incomplete_batch: bool = False,
+            self,
+            array_size: int,
+            window_size: int,
+            batch_size: int,
+            excludes: Tensor | None = None,
+            shuffle: bool = False,
+            ignore_incomplete_batch: bool = False,
     ):
         if window_size < 1:
             raise ValueError(
@@ -549,8 +552,8 @@ class BatchSlidingWindow:
         return len(self._indices)
 
     def get_iterator(
-        self,
-        arrays: Iterable[Tensor],
+            self,
+            arrays: Iterable[Tensor],
     ) -> Iterator[tuple[Tensor, ...]]:
         """
         Produit les fenêtres pour chaque tenseur fourni.
@@ -574,9 +577,9 @@ class BatchSlidingWindow:
             indices = indices[permutation]
 
         for batch_slice in minibatch_slices_iterator(
-            length=len(indices),
-            batch_size=self._batch_size,
-            ignore_incomplete_batch=self._ignore_incomplete_batch,
+                length=len(indices),
+                batch_size=self._batch_size,
+                ignore_incomplete_batch=self._ignore_incomplete_batch,
         ):
             batch_end_indices = indices[batch_slice].unsqueeze(dim=1)
 

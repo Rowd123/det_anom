@@ -165,7 +165,7 @@ def main(config) -> None:
     if config.restore_dir is not None:
         checkpoint_path = (
             Path(config.restore_dir)
-            / "omni_anomaly.pt"
+            / "best_omni_anomaly.pt"
         )
 
         trainer.load_checkpoint(checkpoint_path)
@@ -364,6 +364,8 @@ if __name__ == "__main__":
     config = load_config(
         arguments.config
     )
+
+    print("GPU available: ", torch.cuda.is_available())
 
     # x_dim dépend du dataset sélectionné.
     config.x_dim = get_data_dim(

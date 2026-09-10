@@ -506,4 +506,3 @@ class Decoder(nn.Module):
             "loc": mean,
             "scale": scale,
         }
-

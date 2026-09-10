@@ -1,6 +1,6 @@
 # Dataset
 dataset: PMU
-data_dir: /home/taklarid/Projects/code/fetch_pmu_data/out_openhistorian/Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-081000__50Hz.csv
+data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
 x_dim: null
 
 # Architecture
@@ -21,7 +21,7 @@ nf_layers: 20
 std_epsilon: 0.0001
 
 # Entraînement
-max_epoch: 2
+max_epoch: 10
 max_step: null
 train_start: 0
 max_train_size: 0.8
@@ -29,15 +29,15 @@ batch_size: 50
 valid_batch_size: 50
 valid_step_freq: 100
 
-initial_lr: 0.001
+initial_lr: 0.0005
 lr_anneal_factor: 0.5
-lr_anneal_epoch_freq: 40
+lr_anneal_epoch_freq: 10
 
 l2_reg: 0.0001
 gradient_clip_norm: 10.0
 
 early_stop: true
-early_stopping_patience: 20
+early_stopping_patience: 300
 valid_portion: 0.3
 
 # Évaluation
@@ -62,7 +62,7 @@ device: null
 # Résultats et sauvegardes
 save_z: false
 save_dir: model
-restore_dir: null
+restore_dir: model
 result_dir: result
 
 train_score_filename: train_score.pkl

@@ -4,7 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
-
+import numpy as np
 import pyro
 import torch
 from torch import Tensor, nn
@@ -165,6 +165,8 @@ class Trainer:
 
         self._check_loss(loss)
 
+        loss /= len(batch_x)
+
         loss.backward()
 
         self._check_gradients()
@@ -249,7 +251,7 @@ class Trainer:
 
         if excludes is not None:
             excludes = torch.as_tensor(
-                excludes,
+                np.array(excludes),
                 dtype=torch.bool,
             )
 
@@ -473,5 +475,3 @@ class Trainer:
             self._scheduler.load_state_dict(
                 checkpoint["scheduler_state_dict"]
             )
-
-        self._global_step = checkpoint["global_step"]

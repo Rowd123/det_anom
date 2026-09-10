@@ -122,6 +122,7 @@ class Predictor:
             )
 
         if excludes is not None:
+            excludes = np.array(excludes)
             excludes = torch.as_tensor(
                 excludes,
                 dtype=torch.bool,

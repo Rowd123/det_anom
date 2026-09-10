@@ -261,4 +261,3 @@ class OmniAnomaly(nn.Module):
 
         return reconstruction_log_prob, z_statistics
 
-
