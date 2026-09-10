@@ -195,6 +195,9 @@ class OmniAnomaly(nn.Module):
             objective="elbo",
         )
 
+    def get_per_window_loss(self, x: Tensor, n_z: int = 1) -> dict[str, Tensor]:
+        return self.vae.get_per_window_loss(x=x, n_z=n_z)
+
     @torch.no_grad()
     def get_score(
         self,
@@ -260,4 +263,3 @@ class OmniAnomaly(nn.Module):
             )
 
         return reconstruction_log_prob, z_statistics
-
