@@ -203,6 +203,11 @@ def main(config) -> None:
                 if save_directory is not None
                 else None
             ),
+            diagnostics_path=(
+                result_directory / config.training_diagnostics_filename
+                if config.training_diagnostics_filename is not None
+                else None
+            ),
         )
 
         training_duration = (
@@ -211,6 +216,21 @@ def main(config) -> None:
 
         metrics.update(training_metrics)
         metrics["train_total_time"] = training_duration
+
+    if config.mc_validation_diagnostic_enabled:
+        if config.run_mode != "evaluate":
+            raise ValueError(
+                "Le diagnostic Monte-Carlo doit être lancé en mode evaluate "
+                "sur un checkpoint fixe"
+            )
+        mc_diagnostic = trainer.monte_carlo_validation(
+            values=x_train,
+            valid_portion=config.valid_portion,
+            excludes=x_train_exclude,
+            repetitions=config.mc_validation_repetitions,
+            n_z=config.mc_validation_n_z,
+        )
+        metrics["mc_validation_diagnostic"] = mc_diagnostic
 
     # ------------------------------------------------------------
     # Scores d'entraînement pour POT

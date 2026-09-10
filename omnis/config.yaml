@@ -58,6 +58,11 @@ test_n_z: 16
 test_batch_size: 32
 max_test_size: null
 
+# Diagnostic de stabilité Monte-Carlo (mode evaluate uniquement)
+mc_validation_diagnostic_enabled: false
+mc_validation_repetitions: 10
+mc_validation_n_z: 8
+
 get_score_on_dim: false
 
 # Recherche du meilleur seuil
@@ -80,3 +85,4 @@ result_dir: result
 train_score_filename: train_score.pkl
 test_score_filename: test_score.pkl
 metrics_filename: metrics.json
+training_diagnostics_filename: training_diagnostics.json
