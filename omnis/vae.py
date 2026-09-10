@@ -392,6 +392,37 @@ class VAE(nn.Module):
             x,
         )
 
+    def get_per_window_loss(self, x: Tensor, n_z: int = 1) -> dict[str, Tensor]:
+        """Calcule la même ELBO Monte-Carlo, sans réduire le batch Pyro."""
+        if n_z < 1:
+            raise ValueError("n_z doit être supérieur ou égal à 1")
+
+        posterior = self.posterior(x)
+        z = posterior.rsample(torch.Size([n_z]))
+        prior = self.prior(x)
+        likelihood = self.likelihood(z)
+
+        log_px = likelihood.log_prob(x)
+        log_pz = prior.log_prob(z)
+        log_qz = posterior.log_prob(z)
+        nll = -log_px.mean(dim=0)
+        kl = (log_qz - log_pz).mean(dim=0)
+        per_window_loss = nll + kl
+
+        decoder_scale = likelihood.base_dist.scale
+        if hasattr(posterior, "scale_statistics"):
+            posterior_scale = posterior.scale_statistics(z)
+        else:
+            posterior_scale = posterior.base_dist.scale
+
+        return {
+            "loss": per_window_loss,
+            "nll": nll,
+            "kl": kl,
+            "decoder_scale": decoder_scale,
+            "posterior_scale": posterior_scale,
+        }
+
     def make_svi(
         self,
         learning_rate: float = 1e-3,
