@@ -1,6 +1,8 @@
 # trainer.py
 
 from copy import deepcopy
+from collections import deque
+import json
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -9,7 +11,7 @@ import pyro
 import torch
 from torch import Tensor, nn
 
-from utils import BatchSlidingWindow
+from utils import BatchSlidingWindow, MinMaxScaler
 
 
 class Trainer:
@@ -34,8 +36,8 @@ class Trainer:
         weight_decay: Régularisation appliquée aux poids
         grad_clip_norm: Limite la norme totale des gradients pour éviter leur explosion
         check_numerics: Vérifie que la perte et les gradients ne contiennent pas de NaN ou d'infinis
-        early_stopping_patience: Arrête l'entraînement si la perte de validation ne s'améliore pas pendant
-                                le nombre assingé
+        early_stopping_validation_patience: Nombre de contrôles de validation
+                                            consécutifs sans amélioration
         device: où exécuter les calculs (cude - cpu)
 
 
@@ -44,7 +46,8 @@ class Trainer:
     def __init__(
         self,
         model: nn.Module,
-        n_z: int = 1,
+        train_n_z: int = 1,
+        valid_n_z: int = 8,
         max_epoch: Optional[int] = 256,
         max_step: Optional[int] = None,
         batch_size: int = 256,
@@ -58,7 +61,13 @@ class Trainer:
         grad_clip_norm: Optional[float] = 50.0,
         check_numerics: bool = True,
         weight_decay: float = 0.0,
-        early_stopping_patience: int = 20,
+        early_stopping_validation_patience: int = 20,
+        anomaly_filter_enabled: bool = True,
+        anomaly_filter_warmup_epochs: int = 2,
+        anomaly_filter_k: float = 5.0,
+        anomaly_filter_history_size: int = 10000,
+        anomaly_filter_min_history: int = 1000,
+        anomaly_filter_max_fraction: float = 0.10,
         device: Optional[str | torch.device] = None,
     ):
         if max_epoch is None and max_step is None:
@@ -66,16 +75,27 @@ class Trainer:
                 "max_epoch ou max_step doit être défini"
             )
 
-        if n_z < 1:
-            raise ValueError("n_z doit être supérieur ou égal à 1")
+        if train_n_z < 1 or valid_n_z < 1:
+            raise ValueError("train_n_z et valid_n_z doivent être positifs")
 
         if batch_size < 1 or valid_batch_size < 1:
             raise ValueError(
                 "Les tailles de batch doivent être positives"
             )
 
+        if valid_step_freq < 1:
+            raise ValueError(
+                "valid_step_freq doit être supérieur ou égal à 1"
+            )
+
         self._model = model
-        self._n_z = n_z
+        if anomaly_filter_history_size < 1:
+            raise ValueError("anomaly_filter_history_size doit être positif")
+        if not 0.0 <= anomaly_filter_max_fraction < 1.0:
+            raise ValueError("anomaly_filter_max_fraction doit être dans [0, 1[")
+
+        self._train_n_z = train_n_z
+        self._valid_n_z = valid_n_z
         self._max_epoch = max_epoch
         self._max_step = max_step
         self._batch_size = batch_size
@@ -83,7 +103,19 @@ class Trainer:
         self._valid_step_freq = valid_step_freq
         self._grad_clip_norm = grad_clip_norm
         self._check_numerics = check_numerics
-        self._early_stopping_patience = early_stopping_patience
+        self._early_stopping_validation_patience = (
+            early_stopping_validation_patience
+        )
+        self._anomaly_filter_enabled = anomaly_filter_enabled
+        self._anomaly_filter_warmup_epochs = anomaly_filter_warmup_epochs
+        self._anomaly_filter_k = anomaly_filter_k
+        self._anomaly_filter_min_history = anomaly_filter_min_history
+        self._anomaly_filter_max_fraction = anomaly_filter_max_fraction
+        self._loss_history = deque(maxlen=anomaly_filter_history_size)
+        self._recent_batch_losses = deque(maxlen=100)
+        self.scaler = MinMaxScaler()
+        self._diagnostic_generator = torch.Generator(device="cpu")
+        self._diagnostic_generator.manual_seed(1729)
 
         if device is None:
             device = (
@@ -120,6 +152,7 @@ class Trainer:
             self._scheduler = None
 
         self._global_step = 0
+        self._epoch = 0
 
     @property
     def model(self) -> nn.Module:
@@ -130,9 +163,9 @@ class Trainer:
         return self._global_step
 
     def _check_loss(self, loss: Tensor) -> None:
-        if self._check_numerics and not torch.isfinite(loss):
+        if self._check_numerics and not torch.isfinite(loss).all():
             raise FloatingPointError(
-                f"La perte n'est pas finie : {loss.item()}"
+                "La perte contient des NaN ou des infinis"
             )
 
     def _check_gradients(self) -> None:
@@ -148,7 +181,281 @@ class Trainer:
                     f"Le gradient de {name} contient des NaN ou infinis"
                 )
 
-    def _training_step(self, batch_x: Tensor) -> float:
+    @staticmethod
+    def _tensor_stats(values: Tensor) -> tuple[float, float, float]:
+        values = values.detach()
+        return (
+            values.min().item(),
+            values.median().item(),
+            values.max().item(),
+        )
+
+    def _gradient_norm(self) -> float:
+        squared_norm = sum(
+            parameter.grad.detach().norm(2).item() ** 2
+            for parameter in self._model.parameters()
+            if parameter.grad is not None
+        )
+        return squared_norm ** 0.5
+
+    def _gradient_norms_by_group(self) -> dict[str, float]:
+        squared = {"encoder": 0.0, "posterior": 0.0, "decoder": 0.0, "other": 0.0}
+        for name, parameter in self._model.named_parameters():
+            if parameter.grad is None:
+                continue
+            if "posterior" in name:
+                group = "posterior"
+            elif "encoder" in name:
+                group = "encoder"
+            elif "decoder" in name:
+                group = "decoder"
+            else:
+                group = "other"
+            squared[group] += parameter.grad.detach().norm(2).item() ** 2
+        return {name: value ** 0.5 for name, value in squared.items()}
+
+    @staticmethod
+    def _scale_quantiles(values: Tensor) -> dict[str, float]:
+        values = values.detach().flatten().float()
+        quantiles = torch.quantile(
+            values,
+            values.new_tensor([0.01, 0.05, 0.50, 0.95, 0.99]),
+        )
+        return {
+            "min": values.min().item(),
+            "q01": quantiles[0].item(),
+            "q05": quantiles[1].item(),
+            "q50": quantiles[2].item(),
+            "q95": quantiles[3].item(),
+            "q99": quantiles[4].item(),
+            "max": values.max().item(),
+        }
+
+    def _sample_pointwise(
+        self,
+        normalized_error: Tensor,
+        standardized_error: Tensor,
+        sample_size: int = 100_000,
+    ) -> dict:
+        normalized_flat = normalized_error.detach().flatten()
+        standardized_flat = standardized_error.detach().flatten()
+        count = normalized_flat.numel()
+        selected_count = min(sample_size, count)
+        indices = torch.randint(
+            count,
+            (selected_count,),
+            generator=self._diagnostic_generator,
+            device="cpu",
+        ).to(normalized_flat.device)
+        return {
+            "normalized_sample": normalized_flat[indices].float().cpu(),
+            "standardized_sample": standardized_flat[indices].float().cpu(),
+            "count": count,
+            "normalized_min": normalized_flat.min().item(),
+            "normalized_max": normalized_flat.max().item(),
+            "standardized_max": standardized_flat.max().item(),
+            "standardized_sum": standardized_flat.double().sum().item(),
+            "counts_gt": {
+                threshold: (normalized_flat > threshold).sum().item()
+                for threshold in (3, 5, 10, 20)
+            },
+        }
+
+    def _limit_diagnostic_sample(
+        self,
+        values: Tensor,
+        maximum: int = 1_000_000,
+    ) -> Tensor:
+        if values.numel() <= maximum:
+            return values
+        indices = torch.randperm(
+            values.numel(),
+            generator=self._diagnostic_generator,
+        )[:maximum]
+        return values[indices]
+
+    @staticmethod
+    def _pointwise_summary(
+        normalized_sample: Tensor,
+        standardized_sample: Tensor,
+        count: int,
+        normalized_min: float,
+        normalized_max: float,
+        standardized_max: float,
+        counts_gt: dict,
+    ) -> dict:
+        normalized_quantiles = torch.quantile(
+            normalized_sample,
+            normalized_sample.new_tensor(
+                [0.50, 0.90, 0.95, 0.99, 0.999, 0.9999]
+            ),
+        )
+        standardized_quantiles = torch.quantile(
+            standardized_sample,
+            standardized_sample.new_tensor(
+                [0.50, 0.90, 0.95, 0.99, 0.999, 0.9999]
+            ),
+        )
+        normalized_result = {
+            "min": normalized_min,
+            **{
+                name: normalized_quantiles[index].item()
+                for index, name in enumerate(
+                    ("q50", "q90", "q95", "q99", "q99.9", "q99.99")
+                )
+            },
+            "max": normalized_max,
+            "sample_size": normalized_sample.numel(),
+            "approximate": normalized_sample.numel() < count,
+        }
+        standardized_result = {
+            **{
+                name: standardized_quantiles[index].item()
+                for index, name in enumerate(
+                    ("q50", "q90", "q95", "q99", "q99.9", "q99.99")
+                )
+            },
+            "max": standardized_max,
+            "sample_size": standardized_sample.numel(),
+            "approximate": standardized_sample.numel() < count,
+        }
+        fractions = {
+            f"fraction_r_gt_{threshold}": counts_gt[threshold] / count
+            for threshold in (3, 5, 10, 20)
+        }
+        sorted_standardized = standardized_sample.sort(descending=True).values
+        sampled_sum = sorted_standardized.double().sum().item()
+        tail_contributions = {}
+        for fraction, name in (
+            (0.0001, "top_0_01_percent_contribution"),
+            (0.001, "top_0_1_percent_contribution"),
+            (0.01, "top_1_percent_contribution"),
+            (0.05, "top_5_percent_contribution"),
+        ):
+            top_count = max(1, int(np.ceil(len(sorted_standardized) * fraction)))
+            tail_contributions[name] = (
+                sorted_standardized[:top_count].double().sum().item()
+                / sampled_sum if sampled_sum else 0.0
+            )
+        tail_contributions.update({
+            "sample_size": standardized_sample.numel(),
+            "approximate": standardized_sample.numel() < count,
+        })
+        return {
+            "normalized_error_quantiles": normalized_result,
+            "standardized_point_quantiles": standardized_result,
+            "normalized_error_fractions": fractions,
+            "tail_contributions": tail_contributions,
+        }
+
+    @staticmethod
+    def _correlation(left: Tensor, right: Tensor) -> float:
+        left = left.detach().float().flatten()
+        right = right.detach().float().flatten()
+        left = left - left.mean()
+        right = right - right.mean()
+        denominator = left.square().sum().sqrt() * right.square().sum().sqrt()
+        if denominator.item() == 0.0:
+            return float("nan")
+        return (left * right).sum().div(denominator).item()
+
+    @staticmethod
+    def _ranks(values: Tensor) -> Tensor:
+        order = values.detach().flatten().argsort()
+        ranks = torch.empty_like(order, dtype=torch.float32)
+        ranks[order] = torch.arange(len(order), device=order.device).float()
+        return ranks
+
+    def _window_diagnostics(self, components: dict[str, Tensor]) -> dict:
+        if "decoder_scale_mean" in components:
+            per_window_scale_mean = components["decoder_scale_mean"].detach()
+            per_window_scale_min = components["decoder_scale_min"].detach()
+            per_window_scale_median = components["decoder_scale_median"].detach()
+        else:
+            scale = components["decoder_scale"].detach()
+            per_window_scale_mean = scale.mean(dim=(0, 2, 3))
+            per_window_scale_min = scale.amin(dim=(0, 2, 3))
+            per_window_scale_median = (
+                scale.permute(1, 0, 2, 3)
+                .flatten(1)
+                .median(dim=1)
+                .values
+            )
+        losses = components["loss"].detach()
+        mse = components["mse"].detach()
+        correlations = {
+            "pearson_loss_mse": self._correlation(losses, mse),
+            "pearson_loss_scale_mean": self._correlation(losses, per_window_scale_mean),
+            "pearson_loss_scale_min": self._correlation(losses, per_window_scale_min),
+            "spearman_loss_mse": self._correlation(self._ranks(losses), self._ranks(mse)),
+            "spearman_loss_scale_mean": self._correlation(
+                self._ranks(losses), self._ranks(per_window_scale_mean)
+            ),
+            "spearman_loss_scale_min": self._correlation(
+                self._ranks(losses), self._ranks(per_window_scale_min)
+            ),
+        }
+        top_indices = torch.topk(losses, min(10, len(losses))).indices
+        top_windows = []
+        for index in top_indices.tolist():
+            top_windows.append({
+                "index_in_batch": index,
+                "loss": losses[index].item(),
+                "nll": components["nll"][index].detach().item(),
+                "kl": components["kl"][index].detach().item(),
+                "mse": mse[index].item(),
+                "mae": components["mae"][index].detach().item(),
+                "decoder_scale_min": per_window_scale_min[index].item(),
+                "decoder_scale_median": per_window_scale_median[index].item(),
+                "decoder_scale_mean": per_window_scale_mean[index].item(),
+            })
+        return {"correlations": correlations, "top_windows": top_windows}
+
+    @staticmethod
+    def _top_offending_points(
+        components: dict[str, Tensor],
+        window_offset: int,
+        count: int = 20,
+    ) -> list[dict]:
+        standardized = components["pointwise_standardized_error"].detach()
+        normalized = components["normalized_abs_error"].detach()
+        top_values, top_indices = torch.topk(
+            standardized.flatten(), min(count, standardized.numel())
+        )
+        time_size, feature_size = standardized.shape[-2:]
+        records = []
+        for value, flat_index in zip(top_values.tolist(), top_indices.tolist()):
+            window_index = flat_index // (time_size * feature_size)
+            remainder = flat_index % (time_size * feature_size)
+            time_index = remainder // feature_size
+            feature_index = remainder % feature_size
+            observed = components["observed_x"][
+                window_index, time_index, feature_index
+            ].detach().item()
+            reconstructed = components["reconstruction_mean"][
+                window_index, time_index, feature_index
+            ].detach().item()
+            records.append({
+                "standardized_error": value,
+                "normalized_abs_error": normalized[
+                    window_index, time_index, feature_index
+                ].item(),
+                "x": observed,
+                "reconstruction_mean": reconstructed,
+                "abs_error": abs(observed - reconstructed),
+                "decoder_scale_mean": components["decoder_scale_mean"][
+                    window_index, time_index, feature_index
+                ].detach().item(),
+                "decoder_scale_min": components["decoder_scale_min"][
+                    window_index, time_index, feature_index
+                ].detach().item(),
+                "window_index": window_offset + window_index,
+                "time_index": time_index,
+                "feature_index": feature_index,
+            })
+        return records
+
+    def _training_step(self, batch_x: Tensor, epoch: int) -> dict:
         self._model.train()
 
         batch_x = batch_x.to(
@@ -158,40 +465,142 @@ class Trainer:
 
         self._optimizer.zero_grad(set_to_none=True)
 
-        loss = self._model.get_training_loss(
+        components = self._model.get_per_window_loss(
             x=batch_x,
-            n_z=self._n_z,
+            n_z=self._train_n_z,
         )
+        per_window_losses = components["loss"]
+        self._check_loss(per_window_losses)
+
+        detached_losses = per_window_losses.detach()
+        threshold = None
+        filter_status = "disabled"
+        accepted_mask = torch.ones_like(per_window_losses, dtype=torch.bool)
+
+        if self._anomaly_filter_enabled:
+            if epoch <= self._anomaly_filter_warmup_epochs:
+                filter_status = "warm-up"
+            elif len(self._loss_history) < self._anomaly_filter_min_history:
+                filter_status = "insufficient-history"
+            else:
+                history = torch.tensor(
+                    list(self._loss_history),
+                    device=per_window_losses.device,
+                )
+                median = history.median()
+                mad = (history - median).abs().median()
+                threshold_tensor = median + self._anomaly_filter_k * 1.4826 * mad
+                threshold = threshold_tensor.item()
+                rejected = detached_losses > threshold_tensor
+                max_rejected = min(
+                    int(len(batch_x) * self._anomaly_filter_max_fraction),
+                    len(batch_x) - 1,
+                )
+                if rejected.sum().item() > max_rejected:
+                    rejected = torch.zeros_like(rejected)
+                    if max_rejected:
+                        highest = torch.topk(detached_losses, max_rejected).indices
+                        rejected[highest] = True
+                accepted_mask = ~rejected
+                filter_status = "active"
+
+        loss = per_window_losses[accepted_mask].mean()
 
         self._check_loss(loss)
-
-        loss /= len(batch_x)
-
         loss.backward()
 
         self._check_gradients()
+        gradient_norm_before = self._gradient_norm()
+        gradient_norms_by_group = self._gradient_norms_by_group()
 
         if self._grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 self._model.parameters(),
                 max_norm=self._grad_clip_norm,
             )
+        gradient_norm_after = self._gradient_norm()
 
         self._optimizer.step()
         self._global_step += 1
 
-        return loss.detach().item()
+        history_values = detached_losses[accepted_mask]
+        self._loss_history.extend(history_values.cpu().tolist())
+        batch_loss = detached_losses.mean().item()
+        self._recent_batch_losses.append(batch_loss)
+        rejected_windows = (~accepted_mask).sum().item()
+        window_diagnostics = self._window_diagnostics(components)
+        point_sample = self._sample_pointwise(
+            components["normalized_abs_error"],
+            components["pointwise_standardized_error"],
+            sample_size=20_000,
+        )
+        point_summary = self._pointwise_summary(
+            point_sample["normalized_sample"],
+            point_sample["standardized_sample"],
+            point_sample["count"],
+            point_sample["normalized_min"],
+            point_sample["normalized_max"],
+            point_sample["standardized_max"],
+            point_sample["counts_gt"],
+        )
+        return {
+            "batch_loss_mean": batch_loss,
+            "filtered_loss": loss.detach().item(),
+            "nll": components["nll"].detach().mean().item(),
+            "kl": components["kl"].detach().mean().item(),
+            "decoder_scale": self._tensor_stats(components["decoder_scale"]),
+            "posterior_scale": self._tensor_stats(components["posterior_scale"]),
+            "decoder_scale_quantiles": self._scale_quantiles(
+                components["decoder_scale"]
+            ),
+            "mse": components["mse"].detach().mean().item(),
+            "mae": components["mae"].detach().mean().item(),
+            "log_sigma_term": components["log_sigma_term"].detach().mean().item(),
+            "standardized_error_term": components[
+                "standardized_error_term"
+            ].detach().mean().item(),
+            "gradient_norm_before": gradient_norm_before,
+            "gradient_norm_after": gradient_norm_after,
+            "gradient_norms_by_group": gradient_norms_by_group,
+            "threshold": threshold,
+            "filter_status": filter_status,
+            "rejected_windows": rejected_windows,
+            "total_windows": len(batch_x),
+            "recent_loss": sum(self._recent_batch_losses) / len(self._recent_batch_losses),
+            "point_sample": point_sample,
+            **point_summary,
+            **window_diagnostics,
+        }
 
     @torch.no_grad()
     def _validation_loss(
         self,
         valid_iterator: BatchSlidingWindow,
         valid_values: Tensor,
-    ) -> float:
+        n_z: Optional[int] = None,
+    ) -> dict:
         self._model.eval()
 
-        total_loss = 0.0
-        total_observations = 0
+        collected = {
+            name: [] for name in (
+                "loss", "nll", "kl", "mse", "mae", "log_sigma_term",
+                "standardized_error_term", "decoder_scale_mean",
+                "decoder_scale_min", "decoder_scale_median",
+            )
+        }
+        scale_sample = torch.empty(0, dtype=torch.float32)
+        scale_min = float("inf")
+        scale_max = float("-inf")
+        max_scale_sample_size = 200_000
+        normalized_error_sample = torch.empty(0, dtype=torch.float32)
+        standardized_error_sample = torch.empty(0, dtype=torch.float32)
+        point_count = 0
+        normalized_error_min = float("inf")
+        normalized_error_max = float("-inf")
+        standardized_error_max = float("-inf")
+        normalized_counts_gt = {threshold: 0 for threshold in (3, 5, 10, 20)}
+        top_offending_points = []
+        window_offset = 0
 
         iterator = valid_iterator.get_iterator([valid_values])
 
@@ -201,22 +610,118 @@ class Trainer:
                 dtype=torch.float32,
             )
 
-            loss = self._model.get_training_loss(
+            per_window_losses = self._model.get_per_window_loss(
                 x=batch_x,
-                n_z=self._n_z,
+                n_z=self._valid_n_z if n_z is None else n_z,
             )
 
-            self._check_loss(loss)
+            self._check_loss(per_window_losses["loss"])
 
-            total_loss += loss.item()
-            total_observations += len(batch_x)
+            for name in (
+                "loss", "nll", "kl", "mse", "mae", "log_sigma_term",
+                "standardized_error_term",
+            ):
+                collected[name].append(per_window_losses[name].detach().cpu())
 
-        if total_observations == 0:
+            scale = per_window_losses["decoder_scale"].detach()
+            scale_by_window = scale.permute(1, 0, 2, 3).flatten(1)
+            collected["decoder_scale_mean"].append(
+                scale_by_window.mean(dim=1).cpu()
+            )
+            collected["decoder_scale_min"].append(
+                scale_by_window.amin(dim=1).cpu()
+            )
+            collected["decoder_scale_median"].append(
+                scale_by_window.median(dim=1).values.cpu()
+            )
+
+            flat_scale = scale.flatten().float()
+            scale_min = min(scale_min, flat_scale.min().item())
+            scale_max = max(scale_max, flat_scale.max().item())
+            scale_indices = torch.randint(
+                flat_scale.numel(),
+                (min(20_000, flat_scale.numel()),),
+                generator=self._diagnostic_generator,
+                device="cpu",
+            ).to(flat_scale.device)
+            batch_sample = flat_scale[scale_indices].cpu()
+            scale_sample = self._limit_diagnostic_sample(
+                torch.cat((scale_sample, batch_sample)),
+                max_scale_sample_size,
+            )
+
+            point_sample = self._sample_pointwise(
+                per_window_losses["normalized_abs_error"],
+                per_window_losses["pointwise_standardized_error"],
+            )
+            normalized_error_sample = self._limit_diagnostic_sample(
+                torch.cat((normalized_error_sample, point_sample["normalized_sample"]))
+            )
+            standardized_error_sample = self._limit_diagnostic_sample(
+                torch.cat((standardized_error_sample, point_sample["standardized_sample"]))
+            )
+            point_count += point_sample["count"]
+            normalized_error_min = min(
+                normalized_error_min, point_sample["normalized_min"]
+            )
+            normalized_error_max = max(
+                normalized_error_max, point_sample["normalized_max"]
+            )
+            standardized_error_max = max(
+                standardized_error_max, point_sample["standardized_max"]
+            )
+            for threshold in normalized_counts_gt:
+                normalized_counts_gt[threshold] += point_sample["counts_gt"][threshold]
+            top_offending_points.extend(
+                self._top_offending_points(per_window_losses, window_offset)
+            )
+            top_offending_points = sorted(
+                top_offending_points,
+                key=lambda item: item["standardized_error"],
+                reverse=True,
+            )[:20]
+            window_offset += len(batch_x)
+
+        if not collected["loss"]:
             raise ValueError(
                 "Aucun batch de validation n'a été produit"
             )
 
-        return total_loss / total_observations
+        components = {
+            name: torch.cat(values, dim=0)
+            for name, values in collected.items()
+        }
+        result = {
+            name: components[name].mean().item()
+            for name in (
+                "loss", "nll", "kl", "mse", "mae", "log_sigma_term",
+                "standardized_error_term",
+            )
+        }
+        result["decoder_scale_quantiles"] = self._scale_quantiles(
+            scale_sample
+        )
+        result["decoder_scale_quantiles"]["min"] = scale_min
+        result["decoder_scale_quantiles"]["max"] = scale_max
+        result["decoder_scale_quantiles"]["sample_size"] = int(
+            scale_sample.numel()
+        )
+        result["decoder_scale_quantiles"]["approximate"] = True
+        pointwise_summary = self._pointwise_summary(
+            normalized_error_sample,
+            standardized_error_sample,
+            point_count,
+            normalized_error_min,
+            normalized_error_max,
+            standardized_error_max,
+            normalized_counts_gt,
+        )
+        result.update(pointwise_summary)
+        for rank, point in enumerate(top_offending_points, start=1):
+            point["rank"] = rank
+        result["top_offending_points"] = top_offending_points
+        result.update(self._window_diagnostics(components))
+        return result
 
     def fit(
         self,
@@ -224,6 +729,7 @@ class Trainer:
         valid_portion: float = 0.3,
         excludes: Optional[Tensor] = None,
         checkpoint_path: Optional[str | Path] = None,
+        diagnostics_path: Optional[str | Path] = None,
     ) -> dict[str, float]:
         """
         Entraîne OmniAnomaly.
@@ -278,11 +784,18 @@ class Trainer:
             )
 
         if excludes is None:
-            train_excludes = None
-            valid_excludes = None
+            train_excludes = torch.zeros(len(train_values), dtype=torch.bool)
+            valid_excludes = torch.zeros(len(valid_values), dtype=torch.bool)
         else:
             train_excludes = excludes[:split_index]
             valid_excludes = excludes[split_index:]
+
+        # Le split est fait sur les données physiques brutes. Le scaler ne voit
+        # que la partie entraînement et ignore les lignes exclues/non finies.
+        if not self.scaler.fitted:
+            self.scaler.fit(train_values, train_excludes)
+        train_values = self.scaler.transform(train_values)
+        valid_values = self.scaler.transform(valid_values)
 
         train_sliding_window = BatchSlidingWindow(
             array_size=len(train_values),
@@ -312,16 +825,18 @@ class Trainer:
 
         best_valid_loss = float("inf")
         best_model_state = None
-        epochs_without_improvement = 0
+        validation_checks_without_improvement = 0
 
         train_batch_times = []
         valid_batch_times = []
+        epoch_diagnostics = []
 
-        epoch = 0
+        epoch = self._epoch
         should_stop = False
 
         while not should_stop:
             epoch += 1
+            self._epoch = epoch
 
             if self._max_epoch is not None and epoch > self._max_epoch:
                 break
@@ -332,39 +847,143 @@ class Trainer:
 
             epoch_loss = 0.0
             epoch_observations = 0
+            epoch_sums = {
+                "nll": 0.0,
+                "mse": 0.0,
+                "mae": 0.0,
+                "log_sigma_term": 0.0,
+                "standardized_error_term": 0.0,
+            }
+            epoch_scale_min = float("inf")
+            epoch_scale_medians = []
+            epoch_normalized_sample = torch.empty(0, dtype=torch.float32)
+            epoch_standardized_sample = torch.empty(0, dtype=torch.float32)
+            epoch_point_count = 0
+            epoch_normalized_min = float("inf")
+            epoch_normalized_max = float("-inf")
+            epoch_standardized_max = float("-inf")
+            epoch_counts_gt = {threshold: 0 for threshold in (3, 5, 10, 20)}
 
             for (batch_x,) in train_iterator:
                 batch_start = perf_counter()
 
-                loss = self._training_step(batch_x)
+                step_metrics = self._training_step(batch_x, epoch)
 
                 train_batch_times.append(
                     perf_counter() - batch_start
                 )
 
-                epoch_loss += loss
+                epoch_loss += step_metrics["batch_loss_mean"] * len(batch_x)
                 epoch_observations += len(batch_x)
+                for name in epoch_sums:
+                    epoch_sums[name] += step_metrics[name] * len(batch_x)
+                epoch_scale_min = min(
+                    epoch_scale_min,
+                    step_metrics["decoder_scale_quantiles"]["min"],
+                )
+                epoch_scale_medians.append(
+                    step_metrics["decoder_scale_quantiles"]["q50"]
+                )
+                point_sample = step_metrics["point_sample"]
+                epoch_normalized_sample = self._limit_diagnostic_sample(
+                    torch.cat((
+                        epoch_normalized_sample,
+                        point_sample["normalized_sample"],
+                    ))
+                )
+                epoch_standardized_sample = self._limit_diagnostic_sample(
+                    torch.cat((
+                        epoch_standardized_sample,
+                        point_sample["standardized_sample"],
+                    ))
+                )
+                epoch_point_count += point_sample["count"]
+                epoch_normalized_min = min(
+                    epoch_normalized_min, point_sample["normalized_min"]
+                )
+                epoch_normalized_max = max(
+                    epoch_normalized_max, point_sample["normalized_max"]
+                )
+                epoch_standardized_max = max(
+                    epoch_standardized_max, point_sample["standardized_max"]
+                )
+                for threshold in epoch_counts_gt:
+                    epoch_counts_gt[threshold] += point_sample["counts_gt"][threshold]
 
                 if (
                     self._global_step % self._valid_step_freq == 0
                 ):
                     validation_start = perf_counter()
 
-                    valid_loss = self._validation_loss(
+                    valid_metrics = self._validation_loss(
                         valid_sliding_window,
                         valid_values,
                     )
+                    valid_loss = valid_metrics["loss"]
 
                     valid_batch_times.append(
                         perf_counter() - validation_start
                     )
 
+                    decoder_scale = step_metrics["decoder_scale"]
+                    posterior_scale = step_metrics["posterior_scale"]
+                    gradient_groups = step_metrics["gradient_norms_by_group"]
+                    rejected = step_metrics["rejected_windows"]
+                    total = step_metrics["total_windows"]
                     print(
                         f"Epoch {epoch:03d} | "
                         f"step {self._global_step:06d} | "
-                        f"train_loss "
-                        f"{epoch_loss / epoch_observations:.6f} | "
-                        f"valid_loss {valid_loss:.6f}"
+                        f"batch_loss_mean {step_metrics['batch_loss_mean']:.6f} | "
+                        f"filtered_loss {step_metrics['filtered_loss']:.6f} | "
+                        f"recent_loss {step_metrics['recent_loss']:.6f} | "
+                        f"train_loss {epoch_loss / epoch_observations:.6f} | "
+                        f"valid_loss {valid_loss:.6f} | "
+                        f"train_mse {step_metrics['mse']:.6f} | "
+                        f"train_mae {step_metrics['mae']:.6f} | "
+                        f"valid_mse {valid_metrics['mse']:.6f} | "
+                        f"valid_mae {valid_metrics['mae']:.6f} | "
+                        f"train_log_sigma_term {step_metrics['log_sigma_term']:.6f} | "
+                        f"train_standardized_error_term "
+                        f"{step_metrics['standardized_error_term']:.6f} | "
+                        f"valid_log_sigma_term {valid_metrics['log_sigma_term']:.6f} | "
+                        f"valid_standardized_error_term "
+                        f"{valid_metrics['standardized_error_term']:.6f} | "
+                        f"threshold {step_metrics['threshold']} | "
+                        f"filter {step_metrics['filter_status']} | "
+                        f"rejected {rejected}/{total} ({rejected / total:.2%}) | "
+                        f"history_size {len(self._loss_history)} | "
+                        f"decoder_scale[min/median/max] {decoder_scale} | "
+                        f"posterior_scale[min/median/max] {posterior_scale} | "
+                        f"grad_norm[before/after] "
+                        f"{step_metrics['gradient_norm_before']:.6f}/"
+                        f"{step_metrics['gradient_norm_after']:.6f} | "
+                        f"grad_groups {gradient_groups} | "
+                        f"lr {self._optimizer.param_groups[0]['lr']:.8f}"
+                    )
+                    print(
+                        "Diagnostic fenêtres train | "
+                        f"scale={step_metrics['decoder_scale_quantiles']} | "
+                        f"corr={step_metrics['correlations']} | "
+                        f"top10={step_metrics['top_windows']}"
+                    )
+                    print(
+                        "Diagnostic fenêtres valid | "
+                        f"scale={valid_metrics['decoder_scale_quantiles']} | "
+                        f"corr={valid_metrics['correlations']} | "
+                        f"top10={valid_metrics['top_windows']}"
+                    )
+                    print(
+                        "Normalized residual | validation | "
+                        f"quantiles={valid_metrics['normalized_error_quantiles']} | "
+                        f"fractions={valid_metrics['normalized_error_fractions']}"
+                    )
+                    print(
+                        "Standardized-error tail contribution | validation | "
+                        f"{valid_metrics['tail_contributions']}"
+                    )
+                    print(
+                        "Top offending points | validation | "
+                        f"{valid_metrics['top_offending_points']}"
                     )
 
                     if valid_loss < best_valid_loss:
@@ -374,16 +993,16 @@ class Trainer:
                             self._model.state_dict()
                         )
 
-                        epochs_without_improvement = 0
+                        validation_checks_without_improvement = 0
 
                         if checkpoint_path is not None:
                             self.save_checkpoint(checkpoint_path)
                     else:
-                        epochs_without_improvement += 1
+                        validation_checks_without_improvement += 1
 
                     if (
-                        epochs_without_improvement
-                        >= self._early_stopping_patience
+                        validation_checks_without_improvement
+                        >= self._early_stopping_validation_patience
                     ):
                         print("Arrêt anticipé")
                         should_stop = True
@@ -408,8 +1027,79 @@ class Trainer:
                         f"Learning rate diminué à {learning_rate:.8f}"
                     )
 
+            if epoch_observations:
+                valid_metrics = self._validation_loss(
+                    valid_sliding_window,
+                    valid_values,
+                )
+                train_pointwise = self._pointwise_summary(
+                    epoch_normalized_sample,
+                    epoch_standardized_sample,
+                    epoch_point_count,
+                    epoch_normalized_min,
+                    epoch_normalized_max,
+                    epoch_standardized_max,
+                    epoch_counts_gt,
+                )
+                epoch_metrics = {
+                    "epoch": epoch,
+                    "train_loss": epoch_loss / epoch_observations,
+                    "valid_loss": valid_metrics["loss"],
+                    **{
+                        f"train_{name}": value / epoch_observations
+                        for name, value in epoch_sums.items()
+                    },
+                    **{
+                        f"valid_{name}": valid_metrics[name]
+                        for name in epoch_sums
+                    },
+                    "train_decoder_scale_min": epoch_scale_min,
+                    "train_decoder_scale_median": float(
+                        np.median(epoch_scale_medians)
+                    ),
+                    "valid_decoder_scale_min": valid_metrics[
+                        "decoder_scale_quantiles"
+                    ]["min"],
+                    "valid_decoder_scale_median": valid_metrics[
+                        "decoder_scale_quantiles"
+                    ]["q50"],
+                    **{
+                        f"train_{name}": value
+                        for name, value in train_pointwise.items()
+                    },
+                    "valid_normalized_error_quantiles": valid_metrics[
+                        "normalized_error_quantiles"
+                    ],
+                    "valid_standardized_point_quantiles": valid_metrics[
+                        "standardized_point_quantiles"
+                    ],
+                    "valid_normalized_error_fractions": valid_metrics[
+                        "normalized_error_fractions"
+                    ],
+                    "valid_tail_contributions": valid_metrics[
+                        "tail_contributions"
+                    ],
+                    "valid_top_offending_points": valid_metrics[
+                        "top_offending_points"
+                    ],
+                }
+                epoch_diagnostics.append(epoch_metrics)
+                print(f"Résumé époque | {epoch_metrics}")
+                if diagnostics_path is not None:
+                    diagnostics_path = Path(diagnostics_path)
+                    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+                    diagnostics_path.write_text(
+                        json.dumps(epoch_diagnostics, indent=2),
+                        encoding="utf-8",
+                    )
+
         if best_model_state is not None:
-            self._model.load_state_dict(best_model_state)
+            if checkpoint_path is not None and Path(checkpoint_path).is_file():
+                # Restaure ensemble modèle, optimiseur, scheduler, compteur et
+                # scaler afin que le checkpoint final reste reprenable.
+                self.load_checkpoint(checkpoint_path)
+            else:
+                self._model.load_state_dict(best_model_state)
 
         mean_train_time = (
             sum(train_batch_times) / len(train_batch_times)
@@ -427,7 +1117,78 @@ class Trainer:
             "best_valid_loss": best_valid_loss,
             "train_time": mean_train_time,
             "valid_time": mean_valid_time,
+            "diagnostic_summary": self._interpret_diagnostics(epoch_diagnostics),
         }
+
+    @staticmethod
+    def _interpret_diagnostics(history: list[dict]) -> str:
+        if len(history) < 2:
+            return "Historique insuffisant pour interpréter l'évolution."
+        first, last = history[0], history[-1]
+        mse_ratio = last["train_mse"] / max(first["train_mse"], 1e-12)
+        scale_ratio = last["train_decoder_scale_median"] / max(
+            first["train_decoder_scale_median"], 1e-12
+        )
+        valid_gap = last["valid_mse"] / max(last["train_mse"], 1e-12)
+        return (
+            f"train_mse final/initial={mse_ratio:.4g}; "
+            f"decoder_scale_median final/initial={scale_ratio:.4g}; "
+            f"valid_mse/train_mse={valid_gap:.4g}. "
+            "Une baisse forte de MSE indique une mémorisation réelle; une baisse "
+            "surtout portée par sigma avec MSE stable indique un effet de variance."
+        )
+
+    @torch.no_grad()
+    def monte_carlo_validation(
+        self,
+        values,
+        valid_portion: float,
+        excludes=None,
+        repetitions: int = 10,
+        n_z: Optional[int] = None,
+    ) -> dict:
+        """Répète la validation à poids fixes, sans appel à optimizer.step()."""
+        if repetitions < 2:
+            raise ValueError("repetitions doit être supérieur ou égal à 2")
+        values = torch.as_tensor(values, dtype=torch.float32)
+        validation_size = int(len(values) * valid_portion)
+        valid_values = self.scaler.transform(values[-validation_size:])
+        if excludes is None:
+            valid_excludes = None
+        else:
+            valid_excludes = torch.as_tensor(
+                np.asarray(excludes)[-validation_size:], dtype=torch.bool
+            )
+        iterator = BatchSlidingWindow(
+            array_size=len(valid_values),
+            window_size=self.model.window_length,
+            batch_size=self._valid_batch_size,
+            excludes=valid_excludes,
+            shuffle=False,
+            ignore_incomplete_batch=False,
+        )
+        repeated = []
+        for _ in range(repetitions):
+            metrics = self._validation_loss(iterator, valid_values, n_z=n_z)
+            repeated.append({
+                name: metrics[name]
+                for name in ("loss", "nll", "kl", "mse", "mae")
+            })
+        summary = {}
+        for name in repeated[0]:
+            samples = np.asarray([item[name] for item in repeated])
+            summary[name] = {
+                "mean": float(samples.mean()),
+                "std": float(samples.std(ddof=1)),
+                "min": float(samples.min()),
+                "max": float(samples.max()),
+            }
+        print(
+            f"Diagnostic Monte-Carlo validation "
+            f"(repetitions={repetitions}, n_z={n_z or self._valid_n_z}) | "
+            f"{summary}"
+        )
+        return summary
 
     def save_checkpoint(
         self,
@@ -446,6 +1207,9 @@ class Trainer:
                     else None
                 ),
                 "global_step": self._global_step,
+                "epoch": self._epoch,
+                "scaler_state_dict": self.scaler.state_dict(),
+                "loss_history": list(self._loss_history),
             },
             path,
         )
@@ -459,6 +1223,12 @@ class Trainer:
             map_location=self._device,
             weights_only=True,
         )
+
+        if "scaler_state_dict" not in checkpoint:
+            raise ValueError(
+                "Ce checkpoint ancien ne contient pas le scaler requis pour "
+                "une reprise ou une inférence sûre"
+            )
 
         self._model.load_state_dict(
             checkpoint["model_state_dict"]
@@ -475,3 +1245,9 @@ class Trainer:
             self._scheduler.load_state_dict(
                 checkpoint["scheduler_state_dict"]
             )
+
+        self._global_step = checkpoint["global_step"]
+        self._epoch = checkpoint.get("epoch", 0)
+        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        self._loss_history.clear()
+        self._loss_history.extend(checkpoint.get("loss_history", []))

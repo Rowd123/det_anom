@@ -129,7 +129,8 @@ def main(config) -> None:
 
     trainer = Trainer(
         model=model,
-        n_z=1,
+        train_n_z=config.train_n_z,
+        valid_n_z=config.valid_n_z,
         max_epoch=config.max_epoch,
         max_step=config.max_step,
         batch_size=config.batch_size,
@@ -140,11 +141,17 @@ def main(config) -> None:
         lr_anneal_factor=config.lr_anneal_factor,
         grad_clip_norm=config.gradient_clip_norm,
         weight_decay=config.l2_reg,
-        early_stopping_patience=(
-            config.early_stopping_patience
+        early_stopping_validation_patience=(
+            config.early_stopping_validation_patience
             if config.early_stop
             else config.max_epoch + 1
         ),
+        anomaly_filter_enabled=config.anomaly_filter_enabled,
+        anomaly_filter_warmup_epochs=config.anomaly_filter_warmup_epochs,
+        anomaly_filter_k=config.anomaly_filter_k,
+        anomaly_filter_history_size=config.anomaly_filter_history_size,
+        anomaly_filter_min_history=config.anomaly_filter_min_history,
+        anomaly_filter_max_fraction=config.anomaly_filter_max_fraction,
         device=config.device,
     )
 
@@ -154,6 +161,7 @@ def main(config) -> None:
         batch_size=config.test_batch_size,
         last_point_only=True,
         device=config.device,
+        scaler=trainer.scaler,
     )
 
     metrics = {}
@@ -162,11 +170,16 @@ def main(config) -> None:
     # Restauration
     # ------------------------------------------------------------
 
-    if config.restore_dir is not None:
-        checkpoint_path = (
-            Path(config.restore_dir)
-            / "best_omni_anomaly.pt"
-        )
+    valid_modes = {"scratch", "resume", "evaluate"}
+    if config.run_mode not in valid_modes:
+        raise ValueError(f"run_mode doit appartenir à {sorted(valid_modes)}")
+
+    if config.run_mode in {"resume", "evaluate"}:
+        if config.restore_checkpoint is None:
+            raise ValueError(
+                "restore_checkpoint est obligatoire en mode resume ou evaluate"
+            )
+        checkpoint_path = Path(config.restore_checkpoint)
 
         trainer.load_checkpoint(checkpoint_path)
 
@@ -178,7 +191,7 @@ def main(config) -> None:
     # Entraînement
     # ------------------------------------------------------------
 
-    if config.max_epoch > 0:
+    if config.run_mode in {"scratch", "resume"} and config.max_epoch > 0:
         training_start = perf_counter()
 
         training_metrics = trainer.fit(
@@ -190,6 +203,11 @@ def main(config) -> None:
                 if save_directory is not None
                 else None
             ),
+            diagnostics_path=(
+                result_directory / config.training_diagnostics_filename
+                if config.training_diagnostics_filename is not None
+                else None
+            ),
         )
 
         training_duration = (
@@ -199,12 +217,27 @@ def main(config) -> None:
         metrics.update(training_metrics)
         metrics["train_total_time"] = training_duration
 
+    if config.mc_validation_diagnostic_enabled:
+        if config.run_mode != "evaluate":
+            raise ValueError(
+                "Le diagnostic Monte-Carlo doit être lancé en mode evaluate "
+                "sur un checkpoint fixe"
+            )
+        mc_diagnostic = trainer.monte_carlo_validation(
+            values=x_train,
+            valid_portion=config.valid_portion,
+            excludes=x_train_exclude,
+            repetitions=config.mc_validation_repetitions,
+            n_z=config.mc_validation_n_z,
+        )
+        metrics["mc_validation_diagnostic"] = mc_diagnostic
+
     # ------------------------------------------------------------
     # Scores d'entraînement pour POT
     # ------------------------------------------------------------
 
     train_score, train_z, train_prediction_time = (
-        predictor.get_score(x_train)
+        predictor.get_score(x_train, x_train_exclude)
     )
 
     metrics["train_prediction_time"] = (
@@ -321,7 +354,7 @@ def main(config) -> None:
     # Sauvegarde finale
     # ------------------------------------------------------------
 
-    if save_directory is not None:
+    if save_directory is not None and config.run_mode in {"scratch", "resume"}:
         final_checkpoint_path = (
             save_directory
             / "omni_anomaly.pt"
