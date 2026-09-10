@@ -69,6 +69,7 @@ class Trainer:
         anomaly_filter_min_history: int = 1000,
         anomaly_filter_max_fraction: float = 0.10,
         device: Optional[str | torch.device] = None,
+        feature_names=None,
     ):
         if max_epoch is None and max_step is None:
             raise ValueError(
@@ -116,6 +117,9 @@ class Trainer:
         self.scaler = MinMaxScaler()
         self._diagnostic_generator = torch.Generator(device="cpu")
         self._diagnostic_generator.manual_seed(1729)
+        self._feature_names = (
+            tuple(feature_names) if feature_names is not None else None
+        )
 
         if device is None:
             device = (
@@ -418,8 +422,8 @@ class Trainer:
             })
         return {"correlations": correlations, "top_windows": top_windows}
 
-    @staticmethod
     def _top_offending_points(
+        self,
         components: dict[str, Tensor],
         window_offset: int,
         count: int = 20,
@@ -459,6 +463,11 @@ class Trainer:
                 "window_index": window_offset + window_index,
                 "time_index": time_index,
                 "feature_index": feature_index,
+                "feature_name": (
+                    self._feature_names[feature_index]
+                    if self._feature_names is not None
+                    else None
+                ),
             })
         return records
 

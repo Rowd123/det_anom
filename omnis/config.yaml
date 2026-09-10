@@ -48,7 +48,7 @@ lr_anneal_factor: 0.5
 lr_anneal_epoch_freq: 10
 
 l2_reg: 0.0001
-gradient_clip_norm: 50.0
+gradient_clip_norm: null
 
 early_stop: true
 # Nombre de contrôles de validation sans amélioration (pas des époques)
