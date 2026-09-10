@@ -114,6 +114,8 @@ class Trainer:
         self._loss_history = deque(maxlen=anomaly_filter_history_size)
         self._recent_batch_losses = deque(maxlen=100)
         self.scaler = MinMaxScaler()
+        self._diagnostic_generator = torch.Generator(device="cpu")
+        self._diagnostic_generator.manual_seed(1729)
 
         if device is None:
             device = (
@@ -229,6 +231,123 @@ class Trainer:
             "max": values.max().item(),
         }
 
+    def _sample_pointwise(
+        self,
+        normalized_error: Tensor,
+        standardized_error: Tensor,
+        sample_size: int = 100_000,
+    ) -> dict:
+        normalized_flat = normalized_error.detach().flatten()
+        standardized_flat = standardized_error.detach().flatten()
+        count = normalized_flat.numel()
+        selected_count = min(sample_size, count)
+        indices = torch.randint(
+            count,
+            (selected_count,),
+            generator=self._diagnostic_generator,
+            device="cpu",
+        ).to(normalized_flat.device)
+        return {
+            "normalized_sample": normalized_flat[indices].float().cpu(),
+            "standardized_sample": standardized_flat[indices].float().cpu(),
+            "count": count,
+            "normalized_min": normalized_flat.min().item(),
+            "normalized_max": normalized_flat.max().item(),
+            "standardized_max": standardized_flat.max().item(),
+            "standardized_sum": standardized_flat.double().sum().item(),
+            "counts_gt": {
+                threshold: (normalized_flat > threshold).sum().item()
+                for threshold in (3, 5, 10, 20)
+            },
+        }
+
+    def _limit_diagnostic_sample(
+        self,
+        values: Tensor,
+        maximum: int = 1_000_000,
+    ) -> Tensor:
+        if values.numel() <= maximum:
+            return values
+        indices = torch.randperm(
+            values.numel(),
+            generator=self._diagnostic_generator,
+        )[:maximum]
+        return values[indices]
+
+    @staticmethod
+    def _pointwise_summary(
+        normalized_sample: Tensor,
+        standardized_sample: Tensor,
+        count: int,
+        normalized_min: float,
+        normalized_max: float,
+        standardized_max: float,
+        counts_gt: dict,
+    ) -> dict:
+        normalized_quantiles = torch.quantile(
+            normalized_sample,
+            normalized_sample.new_tensor(
+                [0.50, 0.90, 0.95, 0.99, 0.999, 0.9999]
+            ),
+        )
+        standardized_quantiles = torch.quantile(
+            standardized_sample,
+            standardized_sample.new_tensor(
+                [0.50, 0.90, 0.95, 0.99, 0.999, 0.9999]
+            ),
+        )
+        normalized_result = {
+            "min": normalized_min,
+            **{
+                name: normalized_quantiles[index].item()
+                for index, name in enumerate(
+                    ("q50", "q90", "q95", "q99", "q99.9", "q99.99")
+                )
+            },
+            "max": normalized_max,
+            "sample_size": normalized_sample.numel(),
+            "approximate": normalized_sample.numel() < count,
+        }
+        standardized_result = {
+            **{
+                name: standardized_quantiles[index].item()
+                for index, name in enumerate(
+                    ("q50", "q90", "q95", "q99", "q99.9", "q99.99")
+                )
+            },
+            "max": standardized_max,
+            "sample_size": standardized_sample.numel(),
+            "approximate": standardized_sample.numel() < count,
+        }
+        fractions = {
+            f"fraction_r_gt_{threshold}": counts_gt[threshold] / count
+            for threshold in (3, 5, 10, 20)
+        }
+        sorted_standardized = standardized_sample.sort(descending=True).values
+        sampled_sum = sorted_standardized.double().sum().item()
+        tail_contributions = {}
+        for fraction, name in (
+            (0.0001, "top_0_01_percent_contribution"),
+            (0.001, "top_0_1_percent_contribution"),
+            (0.01, "top_1_percent_contribution"),
+            (0.05, "top_5_percent_contribution"),
+        ):
+            top_count = max(1, int(np.ceil(len(sorted_standardized) * fraction)))
+            tail_contributions[name] = (
+                sorted_standardized[:top_count].double().sum().item()
+                / sampled_sum if sampled_sum else 0.0
+            )
+        tail_contributions.update({
+            "sample_size": standardized_sample.numel(),
+            "approximate": standardized_sample.numel() < count,
+        })
+        return {
+            "normalized_error_quantiles": normalized_result,
+            "standardized_point_quantiles": standardized_result,
+            "normalized_error_fractions": fractions,
+            "tail_contributions": tail_contributions,
+        }
+
     @staticmethod
     def _correlation(left: Tensor, right: Tensor) -> float:
         left = left.detach().float().flatten()
@@ -291,6 +410,50 @@ class Trainer:
                 "decoder_scale_mean": per_window_scale_mean[index].item(),
             })
         return {"correlations": correlations, "top_windows": top_windows}
+
+    @staticmethod
+    def _top_offending_points(
+        components: dict[str, Tensor],
+        window_offset: int,
+        count: int = 20,
+    ) -> list[dict]:
+        standardized = components["pointwise_standardized_error"].detach()
+        normalized = components["normalized_abs_error"].detach()
+        top_values, top_indices = torch.topk(
+            standardized.flatten(), min(count, standardized.numel())
+        )
+        time_size, feature_size = standardized.shape[-2:]
+        records = []
+        for value, flat_index in zip(top_values.tolist(), top_indices.tolist()):
+            window_index = flat_index // (time_size * feature_size)
+            remainder = flat_index % (time_size * feature_size)
+            time_index = remainder // feature_size
+            feature_index = remainder % feature_size
+            observed = components["observed_x"][
+                window_index, time_index, feature_index
+            ].detach().item()
+            reconstructed = components["reconstruction_mean"][
+                window_index, time_index, feature_index
+            ].detach().item()
+            records.append({
+                "standardized_error": value,
+                "normalized_abs_error": normalized[
+                    window_index, time_index, feature_index
+                ].item(),
+                "x": observed,
+                "reconstruction_mean": reconstructed,
+                "abs_error": abs(observed - reconstructed),
+                "decoder_scale_mean": components["decoder_scale_mean"][
+                    window_index, time_index, feature_index
+                ].detach().item(),
+                "decoder_scale_min": components["decoder_scale_min"][
+                    window_index, time_index, feature_index
+                ].detach().item(),
+                "window_index": window_offset + window_index,
+                "time_index": time_index,
+                "feature_index": feature_index,
+            })
+        return records
 
     def _training_step(self, batch_x: Tensor, epoch: int) -> dict:
         self._model.train()
@@ -366,6 +529,20 @@ class Trainer:
         self._recent_batch_losses.append(batch_loss)
         rejected_windows = (~accepted_mask).sum().item()
         window_diagnostics = self._window_diagnostics(components)
+        point_sample = self._sample_pointwise(
+            components["normalized_abs_error"],
+            components["pointwise_standardized_error"],
+            sample_size=20_000,
+        )
+        point_summary = self._pointwise_summary(
+            point_sample["normalized_sample"],
+            point_sample["standardized_sample"],
+            point_sample["count"],
+            point_sample["normalized_min"],
+            point_sample["normalized_max"],
+            point_sample["standardized_max"],
+            point_sample["counts_gt"],
+        )
         return {
             "batch_loss_mean": batch_loss,
             "filtered_loss": loss.detach().item(),
@@ -390,6 +567,8 @@ class Trainer:
             "rejected_windows": rejected_windows,
             "total_windows": len(batch_x),
             "recent_loss": sum(self._recent_batch_losses) / len(self._recent_batch_losses),
+            "point_sample": point_sample,
+            **point_summary,
             **window_diagnostics,
         }
 
@@ -413,6 +592,15 @@ class Trainer:
         scale_min = float("inf")
         scale_max = float("-inf")
         max_scale_sample_size = 200_000
+        normalized_error_sample = torch.empty(0, dtype=torch.float32)
+        standardized_error_sample = torch.empty(0, dtype=torch.float32)
+        point_count = 0
+        normalized_error_min = float("inf")
+        normalized_error_max = float("-inf")
+        standardized_error_max = float("-inf")
+        normalized_counts_gt = {threshold: 0 for threshold in (3, 5, 10, 20)}
+        top_offending_points = []
+        window_offset = 0
 
         iterator = valid_iterator.get_iterator([valid_values])
 
@@ -450,19 +638,49 @@ class Trainer:
             flat_scale = scale.flatten().float()
             scale_min = min(scale_min, flat_scale.min().item())
             scale_max = max(scale_max, flat_scale.max().item())
-            sample_step = max(
-                1,
-                (flat_scale.numel() + 19_999) // 20_000,
+            scale_indices = torch.randint(
+                flat_scale.numel(),
+                (min(20_000, flat_scale.numel()),),
+                generator=self._diagnostic_generator,
+                device="cpu",
+            ).to(flat_scale.device)
+            batch_sample = flat_scale[scale_indices].cpu()
+            scale_sample = self._limit_diagnostic_sample(
+                torch.cat((scale_sample, batch_sample)),
+                max_scale_sample_size,
             )
-            batch_sample = flat_scale[::sample_step][:20_000].cpu()
-            scale_sample = torch.cat((scale_sample, batch_sample))
-            if scale_sample.numel() > max_scale_sample_size:
-                indices = torch.linspace(
-                    0,
-                    scale_sample.numel() - 1,
-                    max_scale_sample_size,
-                ).long()
-                scale_sample = scale_sample[indices]
+
+            point_sample = self._sample_pointwise(
+                per_window_losses["normalized_abs_error"],
+                per_window_losses["pointwise_standardized_error"],
+            )
+            normalized_error_sample = self._limit_diagnostic_sample(
+                torch.cat((normalized_error_sample, point_sample["normalized_sample"]))
+            )
+            standardized_error_sample = self._limit_diagnostic_sample(
+                torch.cat((standardized_error_sample, point_sample["standardized_sample"]))
+            )
+            point_count += point_sample["count"]
+            normalized_error_min = min(
+                normalized_error_min, point_sample["normalized_min"]
+            )
+            normalized_error_max = max(
+                normalized_error_max, point_sample["normalized_max"]
+            )
+            standardized_error_max = max(
+                standardized_error_max, point_sample["standardized_max"]
+            )
+            for threshold in normalized_counts_gt:
+                normalized_counts_gt[threshold] += point_sample["counts_gt"][threshold]
+            top_offending_points.extend(
+                self._top_offending_points(per_window_losses, window_offset)
+            )
+            top_offending_points = sorted(
+                top_offending_points,
+                key=lambda item: item["standardized_error"],
+                reverse=True,
+            )[:20]
+            window_offset += len(batch_x)
 
         if not collected["loss"]:
             raise ValueError(
@@ -489,6 +707,19 @@ class Trainer:
             scale_sample.numel()
         )
         result["decoder_scale_quantiles"]["approximate"] = True
+        pointwise_summary = self._pointwise_summary(
+            normalized_error_sample,
+            standardized_error_sample,
+            point_count,
+            normalized_error_min,
+            normalized_error_max,
+            standardized_error_max,
+            normalized_counts_gt,
+        )
+        result.update(pointwise_summary)
+        for rank, point in enumerate(top_offending_points, start=1):
+            point["rank"] = rank
+        result["top_offending_points"] = top_offending_points
         result.update(self._window_diagnostics(components))
         return result
 
@@ -625,6 +856,13 @@ class Trainer:
             }
             epoch_scale_min = float("inf")
             epoch_scale_medians = []
+            epoch_normalized_sample = torch.empty(0, dtype=torch.float32)
+            epoch_standardized_sample = torch.empty(0, dtype=torch.float32)
+            epoch_point_count = 0
+            epoch_normalized_min = float("inf")
+            epoch_normalized_max = float("-inf")
+            epoch_standardized_max = float("-inf")
+            epoch_counts_gt = {threshold: 0 for threshold in (3, 5, 10, 20)}
 
             for (batch_x,) in train_iterator:
                 batch_start = perf_counter()
@@ -646,6 +884,31 @@ class Trainer:
                 epoch_scale_medians.append(
                     step_metrics["decoder_scale_quantiles"]["q50"]
                 )
+                point_sample = step_metrics["point_sample"]
+                epoch_normalized_sample = self._limit_diagnostic_sample(
+                    torch.cat((
+                        epoch_normalized_sample,
+                        point_sample["normalized_sample"],
+                    ))
+                )
+                epoch_standardized_sample = self._limit_diagnostic_sample(
+                    torch.cat((
+                        epoch_standardized_sample,
+                        point_sample["standardized_sample"],
+                    ))
+                )
+                epoch_point_count += point_sample["count"]
+                epoch_normalized_min = min(
+                    epoch_normalized_min, point_sample["normalized_min"]
+                )
+                epoch_normalized_max = max(
+                    epoch_normalized_max, point_sample["normalized_max"]
+                )
+                epoch_standardized_max = max(
+                    epoch_standardized_max, point_sample["standardized_max"]
+                )
+                for threshold in epoch_counts_gt:
+                    epoch_counts_gt[threshold] += point_sample["counts_gt"][threshold]
 
                 if (
                     self._global_step % self._valid_step_freq == 0
@@ -709,6 +972,19 @@ class Trainer:
                         f"corr={valid_metrics['correlations']} | "
                         f"top10={valid_metrics['top_windows']}"
                     )
+                    print(
+                        "Normalized residual | validation | "
+                        f"quantiles={valid_metrics['normalized_error_quantiles']} | "
+                        f"fractions={valid_metrics['normalized_error_fractions']}"
+                    )
+                    print(
+                        "Standardized-error tail contribution | validation | "
+                        f"{valid_metrics['tail_contributions']}"
+                    )
+                    print(
+                        "Top offending points | validation | "
+                        f"{valid_metrics['top_offending_points']}"
+                    )
 
                     if valid_loss < best_valid_loss:
                         best_valid_loss = valid_loss
@@ -756,6 +1032,15 @@ class Trainer:
                     valid_sliding_window,
                     valid_values,
                 )
+                train_pointwise = self._pointwise_summary(
+                    epoch_normalized_sample,
+                    epoch_standardized_sample,
+                    epoch_point_count,
+                    epoch_normalized_min,
+                    epoch_normalized_max,
+                    epoch_standardized_max,
+                    epoch_counts_gt,
+                )
                 epoch_metrics = {
                     "epoch": epoch,
                     "train_loss": epoch_loss / epoch_observations,
@@ -778,6 +1063,25 @@ class Trainer:
                     "valid_decoder_scale_median": valid_metrics[
                         "decoder_scale_quantiles"
                     ]["q50"],
+                    **{
+                        f"train_{name}": value
+                        for name, value in train_pointwise.items()
+                    },
+                    "valid_normalized_error_quantiles": valid_metrics[
+                        "normalized_error_quantiles"
+                    ],
+                    "valid_standardized_point_quantiles": valid_metrics[
+                        "standardized_point_quantiles"
+                    ],
+                    "valid_normalized_error_fractions": valid_metrics[
+                        "normalized_error_fractions"
+                    ],
+                    "valid_tail_contributions": valid_metrics[
+                        "tail_contributions"
+                    ],
+                    "valid_top_offending_points": valid_metrics[
+                        "top_offending_points"
+                    ],
                 }
                 epoch_diagnostics.append(epoch_metrics)
                 print(f"Résumé époque | {epoch_metrics}")
