@@ -17,6 +17,89 @@ DATA_DIMENSIONS = {
 }
 
 
+class MinMaxScaler:
+    """Scaler Min-Max ajusté uniquement sur des observations valides."""
+
+    def __init__(self):
+        self.minimum = None
+        self.maximum = None
+
+    @property
+    def fitted(self) -> bool:
+        return self.minimum is not None and self.maximum is not None
+
+    def fit(self, data, excludes=None):
+        data = torch.as_tensor(data, dtype=torch.float32)
+        if data.ndim != 2:
+            raise ValueError("data doit avoir la forme [temps, variables]")
+        valid_rows = torch.isfinite(data).all(dim=1)
+        if excludes is not None:
+            excludes = torch.as_tensor(
+                np.asarray(excludes),
+                dtype=torch.bool,
+                device=data.device,
+            )
+            if excludes.shape != (len(data),):
+                raise ValueError(f"excludes doit avoir la forme ({len(data)},)")
+            valid_rows &= ~excludes
+        if not valid_rows.any():
+            raise ValueError("Aucune observation valide pour ajuster le scaler")
+        valid_data = data[valid_rows]
+        self.minimum = valid_data.amin(dim=0, keepdim=True)
+        self.maximum = valid_data.amax(dim=0, keepdim=True)
+        return self
+
+    def transform(self, data) -> Tensor:
+        self._check_fitted()
+        data = torch.as_tensor(data, dtype=torch.float32)
+        minimum, maximum = self._parameters_for(data)
+        difference = maximum - minimum
+        scale = torch.where(difference > 0, difference, torch.ones_like(difference))
+        return torch.nan_to_num((data - minimum) / scale)
+
+    def inverse_transform(self, data) -> Tensor:
+        self._check_fitted()
+        data = torch.as_tensor(data, dtype=torch.float32)
+        minimum, maximum = self._parameters_for(data)
+        difference = maximum - minimum
+        scale = torch.where(difference > 0, difference, torch.ones_like(difference))
+        return data * scale + minimum
+
+    def state_dict(self) -> dict[str, Tensor]:
+        self._check_fitted()
+        return {
+            "minimum": self.minimum.detach().cpu().clone(),
+            "maximum": self.maximum.detach().cpu().clone(),
+        }
+
+    def load_state_dict(self, state: dict[str, Tensor]):
+        # Le scaler reste sur CPU dans le checkpoint. transform() déplace ses
+        # paramètres vers le device de l'entrée au moment de leur utilisation.
+        self.minimum = torch.as_tensor(
+            state["minimum"], dtype=torch.float32, device="cpu"
+        )
+        self.maximum = torch.as_tensor(
+            state["maximum"], dtype=torch.float32, device="cpu"
+        )
+        return self
+
+    def _parameters_for(self, data: Tensor) -> tuple[Tensor, Tensor]:
+        if data.ndim < 1 or data.shape[-1] != self.minimum.shape[-1]:
+            raise ValueError(
+                "La dernière dimension des données ne correspond pas au scaler : "
+                f"{data.shape[-1] if data.ndim else None} reçu, "
+                f"{self.minimum.shape[-1]} attendu"
+            )
+        return (
+            self.minimum.to(device=data.device, dtype=data.dtype),
+            self.maximum.to(device=data.device, dtype=data.dtype),
+        )
+
+    def _check_fitted(self) -> None:
+        if not self.fitted:
+            raise RuntimeError("Le scaler doit être ajusté ou restauré avant utilisation")
+
+
 def notre_data_tri(data_file_path):
     df = pd.read_csv(data_file_path, sep=";")
 
@@ -50,6 +133,11 @@ def notre_data_tri(data_file_path):
 
         else:
             df.rename(columns={col: col[-4:]}, inplace=True)
+
+    # Les valeurs non finies ne doivent ni ajuster le scaler ni entrer dans
+    # une fenêtre d'entraînement, même si elles ne sont pas des NaN pandas.
+    finite_rows = np.isfinite(df.to_numpy(dtype=np.float64)).all(axis=1)
+    excluded = np.asarray(excluded, dtype=bool) | ~finite_rows
 
     return df.values, excluded
 
@@ -200,16 +288,32 @@ def get_data(
     DATA, excluded = notre_data_tri(data_directory)
 
     x_dim = get_data_dim(dataset)
+    if DATA.ndim != 2 or DATA.shape[1] != x_dim:
+        raise ValueError(
+            f"Le dataset {dataset} doit contenir {x_dim} variables, "
+            "mais le fichier en contient "
+            f"{DATA.shape[1] if DATA.ndim == 2 else 'un nombre invalide'}"
+        )
 
-    max_train_size = int(DATA.shape[0] * max_train_size)
+    if max_train_size is None:
+        train_size = DATA.shape[0] - train_start
+    elif isinstance(max_train_size, float) and max_train_size <= 1.0:
+        train_size = int(DATA.shape[0] * max_train_size)
+    else:
+        train_size = int(max_train_size)
+
+    if train_start + train_size > DATA.shape[0]:
+        raise ValueError(
+            "La tranche d'entraînement dépasse la taille du dataset"
+        )
 
     train_end = (
         None
         if max_train_size is None
-        else train_start + max_train_size
+        else train_start + train_size
     )
 
-    test_start = train_start + max_train_size
+    test_start = train_start + train_size
 
     test_end = (
         None
@@ -226,6 +330,9 @@ def get_data(
     train_exclude = excluded[train_start:train_end]
     test_data = DATA[test_start:test_end]
     test_exclude = excluded[test_start:test_end]
+    if len(test_data) == 0:
+        test_data = None
+        test_exclude = None
     test_label = None
 
     # ------------------------------------------------------------
@@ -309,41 +416,21 @@ def get_data(
     # Prétraitement
     # ------------------------------------------------------------
 
-    if do_preprocess:
-        train_data = preprocess(
-            train_data,
-        )
+    # Le scaler est ajusté après le split temporel train/validation dans
+    # Trainer.fit. get_data conserve donc les valeurs physiques brutes.
+    train_data = torch.as_tensor(train_data, dtype=torch.float32)
 
-        if test_data is not None:
-            test_data = preprocess(
-                test_data,
-            )
-        else:
-            test_exclude = None
+    if not do_preprocess:
+        train_exclude = torch.zeros(len(train_data), dtype=torch.bool)
 
-    else:
-        train_data = torch.as_tensor(
-            train_data,
-            dtype=torch.float32,
-        )
+    if test_data is not None:
+        test_data = torch.as_tensor(test_data, dtype=torch.float32)
 
-        train_exclude = torch.zeros(
-            len(train_data),
-            dtype=torch.bool,
-        )
-
-        if test_data is not None:
-            test_data = torch.as_tensor(
-                test_data,
-                dtype=torch.float32,
-            )
-
+        if not do_preprocess:
             test_exclude = torch.zeros(
                 len(test_data),
                 dtype=torch.bool,
             )
-        else:
-            test_exclude = None
 
     if print_log:
         print(
@@ -391,7 +478,12 @@ def get_data(
     )
 
 
-def preprocess(data) -> Tensor:
+def preprocess(
+    data,
+    minimum: Optional[Tensor] = None,
+    maximum: Optional[Tensor] = None,
+    return_scaler: bool = False,
+) -> Tensor | tuple[Tensor, Tensor, Tensor]:
     """
     Convertit les données en float32, remplace les NaN,
     puis normalise chaque variable entre 0 et 1.
@@ -419,8 +511,23 @@ def preprocess(data) -> Tensor:
             neginf=0.0,
         )
 
-    minimum = data.amin(dim=0, keepdim=True)
-    maximum = data.amax(dim=0, keepdim=True)
+    fit_scaler = minimum is None and maximum is None
+    if (minimum is None) != (maximum is None):
+        raise ValueError("minimum et maximum doivent être fournis ensemble")
+
+    if fit_scaler:
+        minimum = data.amin(dim=0, keepdim=True)
+        maximum = data.amax(dim=0, keepdim=True)
+    else:
+        minimum = torch.as_tensor(minimum, dtype=data.dtype, device=data.device)
+        maximum = torch.as_tensor(maximum, dtype=data.dtype, device=data.device)
+
+        expected_shape = (1, data.shape[1])
+        if minimum.shape != expected_shape or maximum.shape != expected_shape:
+            raise ValueError(
+                "minimum et maximum doivent avoir la forme "
+                f"{expected_shape}"
+            )
 
     difference = maximum - minimum
 
@@ -434,6 +541,9 @@ def preprocess(data) -> Tensor:
     data = (data - minimum) / safe_difference
 
     print("Données normalisées")
+
+    if return_scaler:
+        return data, minimum, maximum
 
     return data
 

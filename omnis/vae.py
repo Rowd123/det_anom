@@ -392,6 +392,54 @@ class VAE(nn.Module):
             x,
         )
 
+    def get_per_window_loss(self, x: Tensor, n_z: int = 1) -> dict[str, Tensor]:
+        """Calcule la même ELBO Monte-Carlo, sans réduire le batch Pyro."""
+        if n_z < 1:
+            raise ValueError("n_z doit être supérieur ou égal à 1")
+
+        posterior = self.posterior(x)
+        z = posterior.rsample(torch.Size([n_z]))
+        prior = self.prior(x)
+        likelihood = self.likelihood(z)
+
+        log_px = likelihood.log_prob(x)
+        log_pz = prior.log_prob(z)
+        log_qz = posterior.log_prob(z)
+        nll = -log_px.mean(dim=0)
+        kl = (log_qz - log_pz).mean(dim=0)
+        per_window_loss = nll + kl
+
+        decoder_scale = likelihood.base_dist.scale
+        reconstruction_mean = likelihood.base_dist.loc.mean(dim=0)
+        reconstruction_error = reconstruction_mean - x
+        reconstruction_mse = reconstruction_error.square().mean(dim=(-2, -1))
+        reconstruction_mae = reconstruction_error.abs().mean(dim=(-2, -1))
+
+        # Même réduction événementielle que log p(x|z), puis moyenne MC.
+        decoder_loc = likelihood.base_dist.loc
+        expanded_x = x.unsqueeze(0)
+        log_sigma_term = decoder_scale.log().sum(dim=(-2, -1)).mean(dim=0)
+        standardized_error_term = (
+            (expanded_x - decoder_loc).square()
+            / (2.0 * decoder_scale.square())
+        ).sum(dim=(-2, -1)).mean(dim=0)
+        if hasattr(posterior, "scale_statistics"):
+            posterior_scale = posterior.scale_statistics(z)
+        else:
+            posterior_scale = posterior.base_dist.scale
+
+        return {
+            "loss": per_window_loss,
+            "nll": nll,
+            "kl": kl,
+            "decoder_scale": decoder_scale,
+            "posterior_scale": posterior_scale,
+            "mse": reconstruction_mse,
+            "mae": reconstruction_mae,
+            "log_sigma_term": log_sigma_term,
+            "standardized_error_term": standardized_error_term,
+        }
+
     def make_svi(
         self,
         learning_rate: float = 1e-3,

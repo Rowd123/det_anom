@@ -5,7 +5,11 @@ from torch import Tensor, nn
 
 import pyro.distributions as dist
 
-from units import GaussianRandomWalk, DistributionParameterNetwork
+from units import (
+    DistributionParameterNetwork,
+    FixedScaleDistributionParameterNetwork,
+    GaussianRandomWalk,
+)
 from units import RecurrentPosteriorInputNetwork, RNNNetwork, SoftplusStd
 from recurrent_distributions import RecurrentDistribution
 from vae import VAE
@@ -118,12 +122,24 @@ class OmniAnomaly(nn.Module):
             dense_dim=config.dense_dim,
         )
 
-        self.decoder = DistributionParameterNetwork(
-            hidden_network=decoder_rnn,
-            hidden_dim=config.dense_dim,
-            output_dim=config.x_dim,
-            std_epsilon=config.std_epsilon,
-        )
+        if config.decoder_scale_mode == "learned":
+            self.decoder = DistributionParameterNetwork(
+                hidden_network=decoder_rnn,
+                hidden_dim=config.dense_dim,
+                output_dim=config.x_dim,
+                std_epsilon=config.std_epsilon,
+            )
+        elif config.decoder_scale_mode == "fixed":
+            self.decoder = FixedScaleDistributionParameterNetwork(
+                hidden_network=decoder_rnn,
+                hidden_dim=config.dense_dim,
+                output_dim=config.x_dim,
+                fixed_scale=config.decoder_fixed_scale,
+            )
+        else:
+            raise ValueError(
+                "decoder_scale_mode doit être 'learned' ou 'fixed'"
+            )
 
         # ------------------------------------------------------------
         # Prior p(z)
@@ -195,6 +211,9 @@ class OmniAnomaly(nn.Module):
             objective="elbo",
         )
 
+    def get_per_window_loss(self, x: Tensor, n_z: int = 1) -> dict[str, Tensor]:
+        return self.vae.get_per_window_loss(x=x, n_z=n_z)
+
     @torch.no_grad()
     def get_score(
         self,
@@ -260,4 +279,3 @@ class OmniAnomaly(nn.Module):
             )
 
         return reconstruction_log_prob, z_statistics
-
