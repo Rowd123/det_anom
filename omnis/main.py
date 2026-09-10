@@ -157,6 +157,7 @@ def main(config) -> None:
         anomaly_filter_min_history=config.anomaly_filter_min_history,
         anomaly_filter_max_fraction=config.anomaly_filter_max_fraction,
         device=config.device,
+        feature_names=feature_representation.model_names,
     )
 
     predictor = Predictor(
