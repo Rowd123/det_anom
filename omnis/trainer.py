@@ -248,10 +248,20 @@ class Trainer:
         return ranks
 
     def _window_diagnostics(self, components: dict[str, Tensor]) -> dict:
-        scale = components["decoder_scale"].detach()
-        per_window_scale_mean = scale.mean(dim=(0, 2, 3))
-        per_window_scale_min = scale.amin(dim=(0, 2, 3))
-        per_window_scale_median = scale.permute(1, 0, 2, 3).flatten(1).median(dim=1).values
+        if "decoder_scale_mean" in components:
+            per_window_scale_mean = components["decoder_scale_mean"].detach()
+            per_window_scale_min = components["decoder_scale_min"].detach()
+            per_window_scale_median = components["decoder_scale_median"].detach()
+        else:
+            scale = components["decoder_scale"].detach()
+            per_window_scale_mean = scale.mean(dim=(0, 2, 3))
+            per_window_scale_min = scale.amin(dim=(0, 2, 3))
+            per_window_scale_median = (
+                scale.permute(1, 0, 2, 3)
+                .flatten(1)
+                .median(dim=1)
+                .values
+            )
         losses = components["loss"].detach()
         mse = components["mse"].detach()
         correlations = {
@@ -395,9 +405,14 @@ class Trainer:
         collected = {
             name: [] for name in (
                 "loss", "nll", "kl", "mse", "mae", "log_sigma_term",
-                "standardized_error_term", "decoder_scale",
+                "standardized_error_term", "decoder_scale_mean",
+                "decoder_scale_min", "decoder_scale_median",
             )
         }
+        scale_sample = torch.empty(0, dtype=torch.float32)
+        scale_min = float("inf")
+        scale_max = float("-inf")
+        max_scale_sample_size = 200_000
 
         iterator = valid_iterator.get_iterator([valid_values])
 
@@ -414,8 +429,40 @@ class Trainer:
 
             self._check_loss(per_window_losses["loss"])
 
-            for name in collected:
+            for name in (
+                "loss", "nll", "kl", "mse", "mae", "log_sigma_term",
+                "standardized_error_term",
+            ):
                 collected[name].append(per_window_losses[name].detach().cpu())
+
+            scale = per_window_losses["decoder_scale"].detach()
+            scale_by_window = scale.permute(1, 0, 2, 3).flatten(1)
+            collected["decoder_scale_mean"].append(
+                scale_by_window.mean(dim=1).cpu()
+            )
+            collected["decoder_scale_min"].append(
+                scale_by_window.amin(dim=1).cpu()
+            )
+            collected["decoder_scale_median"].append(
+                scale_by_window.median(dim=1).values.cpu()
+            )
+
+            flat_scale = scale.flatten().float()
+            scale_min = min(scale_min, flat_scale.min().item())
+            scale_max = max(scale_max, flat_scale.max().item())
+            sample_step = max(
+                1,
+                (flat_scale.numel() + 19_999) // 20_000,
+            )
+            batch_sample = flat_scale[::sample_step][:20_000].cpu()
+            scale_sample = torch.cat((scale_sample, batch_sample))
+            if scale_sample.numel() > max_scale_sample_size:
+                indices = torch.linspace(
+                    0,
+                    scale_sample.numel() - 1,
+                    max_scale_sample_size,
+                ).long()
+                scale_sample = scale_sample[indices]
 
         if not collected["loss"]:
             raise ValueError(
@@ -423,7 +470,7 @@ class Trainer:
             )
 
         components = {
-            name: torch.cat(values, dim=1 if name == "decoder_scale" else 0)
+            name: torch.cat(values, dim=0)
             for name, values in collected.items()
         }
         result = {
@@ -434,8 +481,14 @@ class Trainer:
             )
         }
         result["decoder_scale_quantiles"] = self._scale_quantiles(
-            components["decoder_scale"]
+            scale_sample
         )
+        result["decoder_scale_quantiles"]["min"] = scale_min
+        result["decoder_scale_quantiles"]["max"] = scale_max
+        result["decoder_scale_quantiles"]["sample_size"] = int(
+            scale_sample.numel()
+        )
+        result["decoder_scale_quantiles"]["approximate"] = True
         result.update(self._window_diagnostics(components))
         return result
 
