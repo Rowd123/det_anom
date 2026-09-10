@@ -111,12 +111,17 @@ def main(config) -> None:
     # Données
     # ------------------------------------------------------------
 
-    (x_train, _, x_train_exclude), (x_test, x_label , x_test_exclude) = get_data(
+    (
+        (x_train, _, x_train_exclude),
+        (x_test, x_label, x_test_exclude),
+        feature_representation,
+    ) = get_data(
         dataset=config.dataset,
         data_directory=config.data_dir,
         max_train_size=config.max_train_size,
         max_test_size=config.max_test_size,
         train_start=config.train_start,
+        return_metadata=True,
     )
 
     # ------------------------------------------------------------
@@ -153,6 +158,7 @@ def main(config) -> None:
         anomaly_filter_min_history=config.anomaly_filter_min_history,
         anomaly_filter_max_fraction=config.anomaly_filter_max_fraction,
         device=config.device,
+        feature_names=feature_representation.model_names,
     )
 
     predictor = Predictor(
