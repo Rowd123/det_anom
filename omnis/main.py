@@ -114,7 +114,7 @@ def main(config) -> None:
     (
         (x_train, _, x_train_exclude),
         (x_test, x_label, x_test_exclude),
-        feature_representation,
+        _feature_representation,
     ) = get_data(
         dataset=config.dataset,
         data_directory=config.data_dir,
@@ -140,7 +140,6 @@ def main(config) -> None:
         max_step=config.max_step,
         batch_size=config.batch_size,
         valid_batch_size=config.valid_batch_size,
-        valid_step_freq=config.valid_step_freq,
         initial_lr=config.initial_lr,
         lr_anneal_epochs=config.lr_anneal_epoch_freq,
         lr_anneal_factor=config.lr_anneal_factor,
@@ -209,11 +208,6 @@ def main(config) -> None:
                 if save_directory is not None
                 else None
             ),
-            diagnostics_path=(
-                result_directory / config.training_diagnostics_filename
-                if config.training_diagnostics_filename is not None
-                else None
-            ),
         )
 
         training_duration = (
@@ -222,21 +216,6 @@ def main(config) -> None:
 
         metrics.update(training_metrics)
         metrics["train_total_time"] = training_duration
-
-    if config.mc_validation_diagnostic_enabled:
-        if config.run_mode != "evaluate":
-            raise ValueError(
-                "Le diagnostic Monte-Carlo doit être lancé en mode evaluate "
-                "sur un checkpoint fixe"
-            )
-        mc_diagnostic = trainer.monte_carlo_validation(
-            values=x_train,
-            valid_portion=config.valid_portion,
-            excludes=x_train_exclude,
-            repetitions=config.mc_validation_repetitions,
-            n_z=config.mc_validation_n_z,
-        )
-        metrics["mc_validation_diagnostic"] = mc_diagnostic
 
     # ------------------------------------------------------------
     # Scores d'entraînement pour POT
