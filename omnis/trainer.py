@@ -43,6 +43,7 @@ class Trainer:
         anomaly_filter_min_history: int = 1000,
         anomaly_filter_max_fraction: float = 0.10,
         device: Optional[str | torch.device] = None,
+        feature_names=None,
     ):
         if max_epoch is None and max_step is None:
             raise ValueError("max_epoch ou max_step doit être défini")
