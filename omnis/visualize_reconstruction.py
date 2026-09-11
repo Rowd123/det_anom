@@ -102,19 +102,30 @@ def plot_matplotlib(x, observed, reconstructed, names, mse, output_path):
 
     figure, axes = plt.subplots(
         len(names),
-        2,
-        figsize=(16, max(3 * len(names), 6)),
+        1,
+        figsize=(12, max(3 * len(names), 6)),
         sharex=True,
+        squeeze=False,
     )
     for index, name in enumerate(names):
-        axes[index, 0].plot(x, observed[:, index], color="tab:blue")
-        axes[index, 0].set_title(f"{name} — observé")
-        axes[index, 1].plot(x, reconstructed[:, index], color="tab:orange")
-        axes[index, 1].set_title(f"{name} — reconstruit — MSE={mse[index]:.6g}")
-        axes[index, 0].grid(alpha=0.25)
-        axes[index, 1].grid(alpha=0.25)
+        axis = axes[index, 0]
+        axis.plot(
+            x,
+            observed[:, index],
+            color="tab:blue",
+            label="Observé",
+        )
+        axis.plot(
+            x,
+            reconstructed[:, index],
+            color="tab:orange",
+            linestyle="--",
+            label="Reconstruit",
+        )
+        axis.set_title(f"{name} — MSE={mse[index]:.6g}")
+        axis.grid(alpha=0.25)
+        axis.legend()
     axes[-1, 0].set_xlabel("Indice temporel")
-    axes[-1, 1].set_xlabel("Indice temporel")
     figure.suptitle(
         f"Reconstruction physique — MSE globale={np.nanmean(mse):.6g}"
     )
@@ -129,14 +140,10 @@ def plot_plotly(x, observed, reconstructed, names, mse, output_path):
 
     figure = make_subplots(
         rows=len(names),
-        cols=2,
+        cols=1,
         subplot_titles=[
-            title
+            f"{name} — MSE={mse[index]:.6g}"
             for index, name in enumerate(names)
-            for title in (
-                f"{name} — observé",
-                f"{name} — reconstruit — MSE={mse[index]:.6g}",
-            )
         ],
         shared_xaxes=True,
         vertical_spacing=min(0.04, 0.8 / len(names)),
@@ -152,9 +159,10 @@ def plot_plotly(x, observed, reconstructed, names, mse, output_path):
                 x=x,
                 y=reconstructed[:, index],
                 name=f"{name} reconstruit",
+                line={"dash": "dash"},
             ),
             row=index + 1,
-            col=2,
+            col=1,
         )
     figure.update_layout(
         height=max(300 * len(names), 600),
