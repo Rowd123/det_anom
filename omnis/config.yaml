@@ -19,19 +19,18 @@ posterior_flow_type: null
 nf_layers: 20
 
 std_epsilon: 0.0001
-decoder_scale_mode: learned  # learned ou fixed
-decoder_fixed_scale: 0.05
 
 # Entraînement
-run_mode: scratch  # scratch, resume ou evaluate
-restore_checkpoint: null
-max_epoch: 10
+run_mode: resume  # scratch, resume ou evaluate
+restore_checkpoint: model/best_omni_anomaly.pt
+max_epoch: 50
 max_step: null
 train_start: 0
 max_train_size: 0.8
 batch_size: 50
 valid_batch_size: 50
-valid_step_freq: 100
+# Affichage léger des moyennes cumulées toutes les 100 mises à jour.
+train_log_step_freq: 100
 train_n_z: 1
 valid_n_z: 8
 
@@ -41,29 +40,23 @@ anomaly_filter_warmup_epochs: 2
 anomaly_filter_k: 5.0
 anomaly_filter_history_size: 10000
 anomaly_filter_min_history: 1000
-anomaly_filter_max_fraction: 0.10
 
 initial_lr: 0.0005
 lr_anneal_factor: 0.5
 lr_anneal_epoch_freq: 10
 
 l2_reg: 0.0001
-gradient_clip_norm: 50.0
+gradient_clip_norm: null
 
 early_stop: true
-# Nombre de contrôles de validation sans amélioration (pas des époques)
-early_stopping_validation_patience: 300
+# Nombre d'époques consécutives sans amélioration de valid_loss.
+early_stopping_validation_patience: 10
 valid_portion: 0.3
 
 # Évaluation
 test_n_z: 16
 test_batch_size: 32
 max_test_size: null
-
-# Diagnostic de stabilité Monte-Carlo (mode evaluate uniquement)
-mc_validation_diagnostic_enabled: false
-mc_validation_repetitions: 10
-mc_validation_n_z: 8
 
 get_score_on_dim: false
 
@@ -87,4 +80,3 @@ result_dir: result
 train_score_filename: train_score.pkl
 test_score_filename: test_score.pkl
 metrics_filename: metrics.json
-training_diagnostics_filename: training_diagnostics.json

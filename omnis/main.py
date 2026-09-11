@@ -111,12 +111,17 @@ def main(config) -> None:
     # Données
     # ------------------------------------------------------------
 
-    (x_train, _, x_train_exclude), (x_test, x_label , x_test_exclude) = get_data(
+    (
+        (x_train, _, x_train_exclude),
+        (x_test, x_label, x_test_exclude),
+        _feature_representation,
+    ) = get_data(
         dataset=config.dataset,
         data_directory=config.data_dir,
         max_train_size=config.max_train_size,
         max_test_size=config.max_test_size,
         train_start=config.train_start,
+        return_metadata=True,
     )
 
     # ------------------------------------------------------------
@@ -135,7 +140,7 @@ def main(config) -> None:
         max_step=config.max_step,
         batch_size=config.batch_size,
         valid_batch_size=config.valid_batch_size,
-        valid_step_freq=config.valid_step_freq,
+        train_log_step_freq=config.train_log_step_freq,
         initial_lr=config.initial_lr,
         lr_anneal_epochs=config.lr_anneal_epoch_freq,
         lr_anneal_factor=config.lr_anneal_factor,
@@ -151,7 +156,6 @@ def main(config) -> None:
         anomaly_filter_k=config.anomaly_filter_k,
         anomaly_filter_history_size=config.anomaly_filter_history_size,
         anomaly_filter_min_history=config.anomaly_filter_min_history,
-        anomaly_filter_max_fraction=config.anomaly_filter_max_fraction,
         device=config.device,
     )
 
@@ -203,11 +207,6 @@ def main(config) -> None:
                 if save_directory is not None
                 else None
             ),
-            diagnostics_path=(
-                result_directory / config.training_diagnostics_filename
-                if config.training_diagnostics_filename is not None
-                else None
-            ),
         )
 
         training_duration = (
@@ -216,21 +215,6 @@ def main(config) -> None:
 
         metrics.update(training_metrics)
         metrics["train_total_time"] = training_duration
-
-    if config.mc_validation_diagnostic_enabled:
-        if config.run_mode != "evaluate":
-            raise ValueError(
-                "Le diagnostic Monte-Carlo doit être lancé en mode evaluate "
-                "sur un checkpoint fixe"
-            )
-        mc_diagnostic = trainer.monte_carlo_validation(
-            values=x_train,
-            valid_portion=config.valid_portion,
-            excludes=x_train_exclude,
-            repetitions=config.mc_validation_repetitions,
-            n_z=config.mc_validation_n_z,
-        )
-        metrics["mc_validation_diagnostic"] = mc_diagnostic
 
     # ------------------------------------------------------------
     # Scores d'entraînement pour POT
