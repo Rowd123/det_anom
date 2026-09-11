@@ -460,7 +460,24 @@ class Trainer:
                     break
 
             if observations == 0:
-                raise ValueError("Aucun batch d'entraînement n'a été produit")
+                if total_windows > 0 and rejected_batches > 0:
+                    raise RuntimeError(
+                        "Le filtre d'anomalies a rejeté tous les batches de "
+                        f"l'époque {epoch} ({rejected_batches} batches, "
+                        f"{rejected_windows} fenêtres). Le DataLoader a bien "
+                        "produit des données, mais la règle actuelle rejette un "
+                        "batch entier dès qu'une seule de ses fenêtres dépasse "
+                        "le seuil médiane + k*MAD. Avec l'embedding PMU 20D, "
+                        "la distribution de la loss a changé. Pour diagnostiquer "
+                        "ou entraîner depuis scratch, désactivez temporairement "
+                        "anomaly_filter_enabled, augmentez "
+                        "anomaly_filter_warmup_epochs ou ajustez anomaly_filter_k."
+                    )
+                raise ValueError(
+                    "Le DataLoader n'a produit aucun batch d'entraînement. "
+                    "Vérifiez le nombre de fenêtres valides, batch_size et les "
+                    "masques d'exclusion."
+                )
 
             if self._scheduler is not None:
                 self._scheduler.step()
