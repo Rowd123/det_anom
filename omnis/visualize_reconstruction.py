@@ -17,17 +17,16 @@ import yaml
 from model import OmniAnomaly
 from utils import (
     MinMaxScaler,
-    cartesian_to_phasor,
     get_data,
-    get_data_dim,
     inverse_transform_physical,
+    phase_embedding_to_phasor,
+    validate_checkpoint_model_dimension,
 )
 
 
 def load_config(path: Path) -> SimpleNamespace:
     with path.open("r", encoding="utf-8") as file:
         values = yaml.safe_load(file)
-    values["x_dim"] = get_data_dim(values["dataset"])
     return SimpleNamespace(**values)
 
 
@@ -90,7 +89,7 @@ def physical_squared_errors(observed, reconstructed, representation):
     """Calcule la MSE physique, avec distance circulaire pour les phases."""
     residual = reconstructed - observed
     for phasor in representation.phasors:
-        phase_index = phasor.phase_index
+        phase_index = phasor.physical_phase_index
         residual[:, phase_index] = (
             residual[:, phase_index] + 180.0
         ) % 360.0 - 180.0
@@ -189,6 +188,7 @@ def main(arguments):
     values, _, excludes = train if arguments.split == "train" else test
     if values is None:
         raise ValueError(f"La partie {arguments.split} est vide")
+    config.x_dim = representation.model_dim
 
     checkpoint = arguments.checkpoint
     if checkpoint is None:
@@ -200,6 +200,7 @@ def main(arguments):
         else "cuda" if torch.cuda.is_available() else "cpu"
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    validate_checkpoint_model_dimension(state, config.x_dim)
     model = OmniAnomaly(config).to(device)
     model.load_state_dict(state["model_state_dict"])
     scaler = MinMaxScaler().load_state_dict(state["scaler_state_dict"])
@@ -216,7 +217,7 @@ def main(arguments):
         device=device,
     )
     selected_values = values[indices]
-    observed = cartesian_to_phasor(selected_values, representation).numpy()
+    observed = phase_embedding_to_phasor(selected_values, representation).numpy()
     reconstructed = inverse_transform_physical(
         normalized_reconstruction,
         scaler,

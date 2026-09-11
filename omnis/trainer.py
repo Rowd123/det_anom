@@ -11,7 +11,7 @@ import pyro
 import torch
 from torch import Tensor, nn
 
-from utils import BatchSlidingWindow, MinMaxScaler
+from utils import BatchSlidingWindow, MinMaxScaler, validate_checkpoint_model_dimension
 
 
 class SigmaEpochStatistics:
@@ -329,6 +329,11 @@ class Trainer:
         values = torch.as_tensor(values, dtype=torch.float32)
         if values.ndim != 2:
             raise ValueError("values doit avoir la forme [temps, x_dim]")
+        if values.shape[1] != self.model.x_dims:
+            raise ValueError(
+                f"values contient {values.shape[1]} dimensions, "
+                f"mais le modèle en attend {self.model.x_dims}"
+            )
 
         if excludes is not None:
             excludes = torch.as_tensor(np.array(excludes), dtype=torch.bool)
@@ -357,7 +362,7 @@ class Trainer:
             train_excludes = excludes[:split_index]
             valid_excludes = excludes[split_index:]
 
-        # Le split temporel précède le fit : le scaler cartésien ne voit que
+        # Le split temporel précède le fit : le scaler de l'embedding ne voit que
         # les observations valides de la partie entraînement.
         if not self.scaler.fitted:
             self.scaler.fit(train_values, train_excludes)
@@ -559,6 +564,8 @@ class Trainer:
                 "epoch": self._epoch,
                 "scaler_state_dict": self.scaler.state_dict(),
                 "loss_history": list(self._loss_history),
+                "model_x_dim": self._model.x_dims,
+                "feature_representation": "amplitude_phase_cos_sin_v1",
             },
             path,
         )
@@ -574,6 +581,8 @@ class Trainer:
                 "Ce checkpoint ancien ne contient pas le scaler requis pour "
                 "une reprise ou une inférence sûre"
             )
+
+        validate_checkpoint_model_dimension(checkpoint, self._model.x_dims)
 
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
