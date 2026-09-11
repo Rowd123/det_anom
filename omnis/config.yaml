@@ -21,8 +21,8 @@ nf_layers: 20
 std_epsilon: 0.0001
 
 # Entraînement
-run_mode: scratch  # scratch, resume ou evaluate
-restore_checkpoint: null
+run_mode: resume  # scratch, resume ou evaluate
+restore_checkpoint: model/best_omni_anomaly.pt
 max_epoch: 50
 max_step: null
 train_start: 0
@@ -40,7 +40,6 @@ anomaly_filter_warmup_epochs: 2
 anomaly_filter_k: 5.0
 anomaly_filter_history_size: 10000
 anomaly_filter_min_history: 1000
-anomaly_filter_max_fraction: 0.10
 
 initial_lr: 0.0005
 lr_anneal_factor: 0.5

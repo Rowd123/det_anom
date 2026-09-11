@@ -156,7 +156,6 @@ def main(config) -> None:
         anomaly_filter_k=config.anomaly_filter_k,
         anomaly_filter_history_size=config.anomaly_filter_history_size,
         anomaly_filter_min_history=config.anomaly_filter_min_history,
-        anomaly_filter_max_fraction=config.anomaly_filter_max_fraction,
         device=config.device,
         feature_names=feature_representation.model_names,
     )

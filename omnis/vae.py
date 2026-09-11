@@ -408,11 +408,14 @@ class VAE(nn.Module):
         nll = -log_px.mean(dim=0)
         kl = (log_qz - log_pz).mean(dim=0)
         per_window_loss = nll + kl
+        reconstruction_mean = likelihood.mean.mean(dim=0)
+        mse = (reconstruction_mean - x).square().mean(dim=(-2, -1))
 
         return {
             "loss": per_window_loss,
             "nll": nll,
             "kl": kl,
+            "mse": mse,
         }
 
     def make_svi(

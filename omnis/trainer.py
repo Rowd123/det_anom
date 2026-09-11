@@ -41,7 +41,6 @@ class Trainer:
         anomaly_filter_k: float = 5.0,
         anomaly_filter_history_size: int = 10000,
         anomaly_filter_min_history: int = 1000,
-        anomaly_filter_max_fraction: float = 0.10,
         device: Optional[str | torch.device] = None,
         feature_names=None,
     ):
@@ -61,9 +60,6 @@ class Trainer:
             )
         if anomaly_filter_history_size < 1:
             raise ValueError("anomaly_filter_history_size doit être positif")
-        if not 0.0 <= anomaly_filter_max_fraction < 1.0:
-            raise ValueError("anomaly_filter_max_fraction doit être dans [0, 1[")
-
         self._model = model
         self._train_n_z = train_n_z
         self._valid_n_z = valid_n_z
@@ -81,7 +77,6 @@ class Trainer:
         self._anomaly_filter_warmup_epochs = anomaly_filter_warmup_epochs
         self._anomaly_filter_k = anomaly_filter_k
         self._anomaly_filter_min_history = anomaly_filter_min_history
-        self._anomaly_filter_max_fraction = anomaly_filter_max_fraction
         self._loss_history = deque(maxlen=anomaly_filter_history_size)
         self.scaler = MinMaxScaler()
 
@@ -148,7 +143,7 @@ class Trainer:
         self._check_loss(per_window_losses)
 
         detached_losses = per_window_losses.detach()
-        accepted_mask = torch.ones_like(per_window_losses, dtype=torch.bool)
+        batch_rejected = False
         if (
             self._anomaly_filter_enabled
             and epoch > self._anomaly_filter_warmup_epochs
@@ -161,21 +156,23 @@ class Trainer:
             median = history.median()
             mad = (history - median).abs().median()
             threshold = median + self._anomaly_filter_k * 1.4826 * mad
-            rejected = detached_losses > threshold
-            max_rejected = min(
-                int(len(batch_x) * self._anomaly_filter_max_fraction),
-                len(batch_x) - 1,
-            )
-            if rejected.sum().item() > max_rejected:
-                rejected = torch.zeros_like(rejected)
-                if max_rejected:
-                    highest = torch.topk(detached_losses, max_rejected).indices
-                    rejected[highest] = True
-            accepted_mask = ~rejected
+            batch_rejected = bool((detached_losses > threshold).any().item())
 
-        filtered_loss = per_window_losses[accepted_mask].mean()
-        self._check_loss(filtered_loss)
-        filtered_loss.backward()
+        metrics = {
+            "loss": detached_losses.mean().item(),
+            "nll": components["nll"].detach().mean().item(),
+            "kl": components["kl"].detach().mean().item(),
+            "mse": components["mse"].detach().mean().item(),
+            "rejected_windows": len(batch_x) if batch_rejected else 0,
+            "total_windows": len(batch_x),
+            "batch_rejected": batch_rejected,
+        }
+        if batch_rejected:
+            return metrics
+
+        batch_loss = per_window_losses.mean()
+        self._check_loss(batch_loss)
+        batch_loss.backward()
         self._check_gradients()
 
         if self._grad_clip_norm is not None:
@@ -186,17 +183,8 @@ class Trainer:
 
         self._optimizer.step()
         self._global_step += 1
-        self._loss_history.extend(
-            detached_losses[accepted_mask].cpu().tolist()
-        )
-
-        return {
-            "loss": detached_losses.mean().item(),
-            "nll": components["nll"].detach().mean().item(),
-            "kl": components["kl"].detach().mean().item(),
-            "rejected_windows": (~accepted_mask).sum().item(),
-            "total_windows": len(batch_x),
-        }
+        self._loss_history.extend(detached_losses.cpu().tolist())
+        return metrics
 
     @torch.no_grad()
     def _validation_loss(
@@ -205,7 +193,7 @@ class Trainer:
         valid_values: Tensor,
     ) -> dict[str, float]:
         self._model.eval()
-        totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0}
+        totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
         observations = 0
 
         for (batch_x,) in valid_iterator.get_iterator([valid_values]):
@@ -310,10 +298,11 @@ class Trainer:
                 break
             self._epoch = epoch
 
-            sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0}
+            sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
             observations = 0
             rejected_windows = 0
             total_windows = 0
+            rejected_batches = 0
             epoch_batch_count = len(train_sliding_window) // self._batch_size
 
             train_iterator = train_sliding_window.get_iterator([train_values])
@@ -322,9 +311,12 @@ class Trainer:
                 step = self._training_step(batch_x, epoch)
                 train_batch_times.append(perf_counter() - batch_start)
                 batch_size = len(batch_x)
-                observations += batch_size
-                for name in sums:
-                    sums[name] += step[name] * batch_size
+                if not step["batch_rejected"]:
+                    observations += batch_size
+                    for name in sums:
+                        sums[name] += step[name] * batch_size
+                else:
+                    rejected_batches += 1
                 rejected_windows += step["rejected_windows"]
                 total_windows += step["total_windows"]
 
@@ -333,7 +325,7 @@ class Trainer:
                     or batch_index == epoch_batch_count
                 ):
                     running_metrics = {
-                        name: value / observations
+                        name: value / observations if observations else float("nan")
                         for name, value in sums.items()
                     }
                     print(
@@ -343,8 +335,10 @@ class Trainer:
                         f"train_loss={running_metrics['loss']:.6f} | "
                         f"train_nll={running_metrics['nll']:.6f} | "
                         f"train_kl={running_metrics['kl']:.6f} | "
+                        f"train_mse={running_metrics['mse']:.6f} | "
                         f"rejected_windows="
                         f"{rejected_windows / total_windows:.2%} | "
+                        f"rejected_batches={rejected_batches}/{batch_index} | "
                         f"learning_rate="
                         f"{self._optimizer.param_groups[0]['lr']:.8f}",
                         flush=True,
@@ -378,10 +372,13 @@ class Trainer:
                 f"valid_loss={valid_metrics['loss']:.6f} | "
                 f"train_nll={train_metrics['nll']:.6f} | "
                 f"train_kl={train_metrics['kl']:.6f} | "
+                f"train_mse={train_metrics['mse']:.6f} | "
                 f"valid_nll={valid_metrics['nll']:.6f} | "
                 f"valid_kl={valid_metrics['kl']:.6f} | "
+                f"valid_mse={valid_metrics['mse']:.6f} | "
                 f"learning_rate={learning_rate:.8f} | "
                 f"rejected_windows={rejection_rate:.2%}"
+                f" | rejected_batches={rejected_batches}/{epoch_batch_count}"
             )
 
             if valid_metrics["loss"] < best_valid_loss:
