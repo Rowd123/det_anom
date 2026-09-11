@@ -402,6 +402,17 @@ class VAE(nn.Module):
         prior = self.prior(x)
         likelihood = self.likelihood(z)
 
+        # _to_event encapsule la Normal dans une Independent. Son base_dist
+        # reste la Normal construite par le décodeur et porte son scale.
+        likelihood_base = likelihood
+        while not hasattr(likelihood_base, "scale"):
+            if not hasattr(likelihood_base, "base_dist"):
+                raise TypeError(
+                    "p(x | z) doit exposer le scale de sa loi normale"
+                )
+            likelihood_base = likelihood_base.base_dist
+        sigma = likelihood_base.scale.detach()
+
         log_px = likelihood.log_prob(x)
         log_pz = prior.log_prob(z)
         log_qz = posterior.log_prob(z)
@@ -416,6 +427,9 @@ class VAE(nn.Module):
             "nll": nll,
             "kl": kl,
             "mse": mse,
+            # Vue détachée du scale de likelihood : le Trainer peut ainsi
+            # instrumenter sigma sans conserver ni modifier le graphe de loss.
+            "sigma": sigma,
         }
 
     def make_svi(
