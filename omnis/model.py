@@ -7,7 +7,6 @@ import pyro.distributions as dist
 
 from units import (
     DistributionParameterNetwork,
-    FixedScaleDistributionParameterNetwork,
     GaussianRandomWalk,
 )
 from units import RecurrentPosteriorInputNetwork, RNNNetwork, SoftplusStd
@@ -122,24 +121,12 @@ class OmniAnomaly(nn.Module):
             dense_dim=config.dense_dim,
         )
 
-        if config.decoder_scale_mode == "learned":
-            self.decoder = DistributionParameterNetwork(
-                hidden_network=decoder_rnn,
-                hidden_dim=config.dense_dim,
-                output_dim=config.x_dim,
-                std_epsilon=config.std_epsilon,
-            )
-        elif config.decoder_scale_mode == "fixed":
-            self.decoder = FixedScaleDistributionParameterNetwork(
-                hidden_network=decoder_rnn,
-                hidden_dim=config.dense_dim,
-                output_dim=config.x_dim,
-                fixed_scale=config.decoder_fixed_scale,
-            )
-        else:
-            raise ValueError(
-                "decoder_scale_mode doit être 'learned' ou 'fixed'"
-            )
+        self.decoder = DistributionParameterNetwork(
+            hidden_network=decoder_rnn,
+            hidden_dim=config.dense_dim,
+            output_dim=config.x_dim,
+            std_epsilon=config.std_epsilon,
+        )
 
         # ------------------------------------------------------------
         # Prior p(z)

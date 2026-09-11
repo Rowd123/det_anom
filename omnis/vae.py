@@ -409,60 +409,10 @@ class VAE(nn.Module):
         kl = (log_qz - log_pz).mean(dim=0)
         per_window_loss = nll + kl
 
-        decoder_scale = likelihood.base_dist.scale
-        reconstruction_mean = likelihood.base_dist.loc.mean(dim=0)
-        reconstruction_error = reconstruction_mean - x
-        reconstruction_mse = reconstruction_error.square().mean(dim=(-2, -1))
-        reconstruction_mae = reconstruction_error.abs().mean(dim=(-2, -1))
-
-        # Même réduction événementielle que log p(x|z), puis moyenne MC.
-        decoder_loc = likelihood.base_dist.loc
-        expanded_x = x.unsqueeze(0)
-        log_sigma_term = decoder_scale.log().sum(dim=(-2, -1)).mean(dim=0)
-        pointwise_standardized_error_mc = (
-            (expanded_x - decoder_loc).square()
-            / (2.0 * decoder_scale.square())
-        )
-        pointwise_standardized_error = pointwise_standardized_error_mc.mean(dim=0)
-        normalized_abs_error = (
-            (expanded_x - decoder_loc).abs() / decoder_scale
-        ).mean(dim=0)
-        standardized_error_term = pointwise_standardized_error.sum(
-            dim=(-2, -1)
-        )
-        reference_standardized_error = pointwise_standardized_error_mc.sum(
-            dim=(-2, -1)
-        ).mean(dim=0)
-        if not torch.allclose(
-            standardized_error_term,
-            reference_standardized_error,
-            rtol=1e-5,
-            atol=1e-5,
-        ):
-            raise RuntimeError(
-                "Incohérence numérique du standardized_error_term pointwise"
-            )
-        if hasattr(posterior, "scale_statistics"):
-            posterior_scale = posterior.scale_statistics(z)
-        else:
-            posterior_scale = posterior.base_dist.scale
-
         return {
             "loss": per_window_loss,
             "nll": nll,
             "kl": kl,
-            "decoder_scale": decoder_scale,
-            "posterior_scale": posterior_scale,
-            "mse": reconstruction_mse,
-            "mae": reconstruction_mae,
-            "log_sigma_term": log_sigma_term,
-            "standardized_error_term": standardized_error_term,
-            "normalized_abs_error": normalized_abs_error,
-            "pointwise_standardized_error": pointwise_standardized_error,
-            "reconstruction_mean": reconstruction_mean,
-            "decoder_scale_mean": decoder_scale.mean(dim=0),
-            "decoder_scale_min": decoder_scale.amin(dim=0),
-            "observed_x": x,
         }
 
     def make_svi(
