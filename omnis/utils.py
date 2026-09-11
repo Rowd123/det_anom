@@ -4,6 +4,7 @@ import torch
 from torch import Tensor
 
 import pickle
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,132 @@ DATA_DIMENSIONS = {
     "MSL": 55,
     "PMU": 14
 }
+
+
+@dataclass(frozen=True)
+class PhasorFeatureMapping:
+    amplitude_name: str
+    phase_name: str
+    real_name: str
+    imag_name: str
+    amplitude_index: int
+    phase_index: int
+
+
+@dataclass(frozen=True)
+class FeatureRepresentation:
+    """Correspondance stable entre les variables physiques et celles du modèle."""
+
+    original_names: tuple[str, ...]
+    model_names: tuple[str, ...]
+    phasors: tuple[PhasorFeatureMapping, ...]
+
+
+PMU_FIRST_PHASOR_INDEX = 2
+
+
+def _readable_feature_name(name: str) -> str:
+    return name.strip().replace(" ", "_").lower()
+
+
+def _phasor_name(amplitude_name: str, phase_name: str) -> str:
+    """Produit un nom lisible sans utiliser les noms pour décider des couples."""
+    if amplitude_name.endswith("MAG"):
+        return amplitude_name[:-len("MAG")].rstrip(" _.-")
+
+    common_length = 0
+    for amplitude_character, phase_character in zip(amplitude_name, phase_name):
+        if amplitude_character != phase_character:
+            break
+        common_length += 1
+    common_name = amplitude_name[:common_length].rstrip(" _.-")
+    return common_name or amplitude_name
+
+
+def build_feature_representation(column_names) -> FeatureRepresentation:
+    """Décrit tous les couples PMU (2, 3), (4, 5), ..., dans l'ordre du CSV."""
+    original_names = tuple(str(name) for name in column_names)
+    phasor_feature_count = len(original_names) - PMU_FIRST_PHASOR_INDEX
+    if phasor_feature_count < 0 or phasor_feature_count % 2:
+        raise ValueError(
+            "Les variables PMU à partir de l'indice 2 doivent former des "
+            "couples amplitude/phase"
+        )
+
+    model_names = [_readable_feature_name(name) for name in original_names]
+    phasors = []
+    for amplitude_index in range(
+        PMU_FIRST_PHASOR_INDEX,
+        len(original_names),
+        2,
+    ):
+        phase_index = amplitude_index + 1
+        amplitude_name = original_names[amplitude_index]
+        phase_name = original_names[phase_index]
+        readable_stem = _readable_feature_name(
+            _phasor_name(amplitude_name, phase_name)
+        )
+        mapping = PhasorFeatureMapping(
+            amplitude_name=amplitude_name,
+            phase_name=phase_name,
+            real_name=f"{readable_stem}_real",
+            imag_name=f"{readable_stem}_imag",
+            amplitude_index=amplitude_index,
+            phase_index=phase_index,
+        )
+        phasors.append(mapping)
+        model_names[amplitude_index] = mapping.real_name
+        model_names[phase_index] = mapping.imag_name
+    return FeatureRepresentation(
+        original_names=original_names,
+        model_names=tuple(model_names),
+        phasors=tuple(phasors),
+    )
+
+
+def phasor_to_cartesian(data, representation: FeatureRepresentation):
+    """Convertit les MAG/ANG physiques (degrés) en Re/Im physiques."""
+    is_tensor = isinstance(data, Tensor)
+    values = torch.as_tensor(data).clone() if is_tensor else np.array(data, copy=True)
+    for phasor in representation.phasors:
+        if is_tensor:
+            amplitude = values[..., phasor.amplitude_index].clone()
+            phase = values[..., phasor.phase_index].clone()
+            radians = torch.deg2rad(phase)
+            real, imag = amplitude * torch.cos(radians), amplitude * torch.sin(radians)
+        else:
+            amplitude = values[..., phasor.amplitude_index].copy()
+            phase = values[..., phasor.phase_index].copy()
+            radians = np.deg2rad(phase)
+            real, imag = amplitude * np.cos(radians), amplitude * np.sin(radians)
+        values[..., phasor.amplitude_index] = real
+        values[..., phasor.phase_index] = imag
+    return values
+
+
+def cartesian_to_phasor(data, representation: FeatureRepresentation):
+    """Restaure amplitude et phase en degrés dans [-180, 180]."""
+    is_tensor = isinstance(data, Tensor)
+    values = torch.as_tensor(data).clone() if is_tensor else np.array(data, copy=True)
+    for phasor in representation.phasors:
+        if is_tensor:
+            real = values[..., phasor.amplitude_index].clone()
+            imag = values[..., phasor.phase_index].clone()
+            amplitude = torch.sqrt(real.square() + imag.square())
+            phase = torch.rad2deg(torch.atan2(imag, real))
+        else:
+            real = values[..., phasor.amplitude_index].copy()
+            imag = values[..., phasor.phase_index].copy()
+            amplitude = np.sqrt(np.square(real) + np.square(imag))
+            phase = np.rad2deg(np.arctan2(imag, real))
+        values[..., phasor.amplitude_index] = amplitude
+        values[..., phasor.phase_index] = phase
+    return values
+
+
+def inverse_transform_physical(data, scaler, representation: FeatureRepresentation):
+    """Annule le scaling cartésien avant de revenir aux grandeurs physiques."""
+    return cartesian_to_phasor(scaler.inverse_transform(data), representation)
 
 
 class MinMaxScaler:
@@ -127,19 +254,25 @@ def notre_data_tri(data_file_path):
 
     df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
 
-    for col in df.columns:
-        if col.endswith("MAG") or not col.endswith("ANG"):
-            df.rename(columns={col: col[-6:]}, inplace=True)
-
-        else:
-            df.rename(columns={col: col[-4:]}, inplace=True)
+    representation = build_feature_representation(df.columns)
+    data = df.to_numpy(dtype=np.float64)
 
     # Les valeurs non finies ne doivent ni ajuster le scaler ni entrer dans
     # une fenêtre d'entraînement, même si elles ne sont pas des NaN pandas.
-    finite_rows = np.isfinite(df.to_numpy(dtype=np.float64)).all(axis=1)
+    finite_rows = np.isfinite(data).all(axis=1)
     excluded = np.asarray(excluded, dtype=bool) | ~finite_rows
 
-    return df.values, excluded
+    # Aucune substitution : si MAG ou ANG est invalide, Re et Im le restent et
+    # la ligne demeure exclue par le masque calculé ci-dessus.
+    data = phasor_to_cartesian(data, representation)
+    excluded |= ~np.isfinite(data).all(axis=1)
+
+    return data, excluded, representation
+
+
+def get_data_simple(data_file_path):
+    """Charge un CSV PMU avec exactement la même représentation que get_data."""
+    return notre_data_tri(data_file_path)
 
 
 def to_numpy(data) -> np.ndarray:
@@ -253,6 +386,7 @@ def get_data(
         print_log: bool = True,
         do_preprocess: bool = True,
         train_start: int = 0,
+        return_metadata: bool = False,
 ):
     """
     Charge les données d'entraînement et de test.
@@ -285,7 +419,7 @@ def get_data(
             "max_test_size doit être positif ou None"
         )
 
-    DATA, excluded = notre_data_tri(data_directory)
+    DATA, excluded, representation = get_data_simple(data_directory)
 
     x_dim = get_data_dim(dataset)
     if DATA.ndim != 2 or DATA.shape[1] != x_dim:
@@ -467,7 +601,7 @@ def get_data(
                 int(test_exclude.sum()),
             )
 
-    return (
+    result = (
         train_data,
         None,
         train_exclude,
@@ -476,6 +610,9 @@ def get_data(
         test_label,
         test_exclude,
     )
+    if return_metadata:
+        return (*result, representation)
+    return result
 
 
 def preprocess(
