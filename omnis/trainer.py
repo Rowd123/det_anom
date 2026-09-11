@@ -14,6 +14,99 @@ from torch import Tensor, nn
 from utils import BatchSlidingWindow, MinMaxScaler
 
 
+class SigmaEpochStatistics:
+    """Agrège les sigma d'une époque avec un échantillon mémoire borné."""
+
+    _QUANTILES = {
+        "p01": 0.01,
+        "p10": 0.10,
+        "median": 0.50,
+        "p90": 0.90,
+        "p99": 0.99,
+    }
+
+    def __init__(
+        self,
+        near_floor_threshold: float,
+        reservoir_size: int = 65536,
+        batch_sample_size: int = 4096,
+    ):
+        self._near_floor_threshold = near_floor_threshold
+        self._reservoir_size = reservoir_size
+        self._batch_sample_size = batch_sample_size
+        # Générateur indépendant : le diagnostic ne consomme pas l'état RNG
+        # utilisé pour les échantillons latents et ne change donc pas le modèle.
+        self._generator = torch.Generator(device="cpu").manual_seed(0)
+        self._sample = torch.empty(0, dtype=torch.float32)
+        self._priorities = torch.empty(0, dtype=torch.float32)
+        self._count = 0
+        self._sum = 0.0
+        self._near_floor_count = 0
+        self._minimum = float("inf")
+        self._maximum = float("-inf")
+
+    def update(self, sigma: Tensor) -> None:
+        values = sigma.detach().reshape(-1)
+        count = values.numel()
+        if count == 0:
+            return
+
+        self._count += count
+        self._sum += values.sum(dtype=torch.float64).item()
+        self._near_floor_count += (
+            values <= self._near_floor_threshold
+        ).sum().item()
+        self._minimum = min(self._minimum, values.min().item())
+        self._maximum = max(self._maximum, values.max().item())
+
+        sample_size = min(count, self._batch_sample_size)
+        if sample_size == count:
+            batch_sample = values.to(device="cpu", dtype=torch.float32)
+        else:
+            indices = torch.randint(
+                count,
+                (sample_size,),
+                generator=self._generator,
+                device="cpu",
+            ).to(values.device)
+            batch_sample = values.index_select(0, indices).to(
+                device="cpu",
+                dtype=torch.float32,
+            )
+
+        priorities = torch.rand(
+            sample_size,
+            generator=self._generator,
+            dtype=torch.float32,
+        )
+        self._sample = torch.cat((self._sample, batch_sample))
+        self._priorities = torch.cat((self._priorities, priorities))
+        if self._sample.numel() > self._reservoir_size:
+            kept = self._priorities.topk(self._reservoir_size).indices
+            self._sample = self._sample[kept]
+            self._priorities = self._priorities[kept]
+
+    def compute(self) -> dict[str, float]:
+        if self._count == 0:
+            raise ValueError("Aucun sigma n'a été agrégé")
+
+        quantile_levels = torch.tensor(list(self._QUANTILES.values()))
+        quantile_values = torch.quantile(self._sample, quantile_levels)
+        statistics = {
+            "sigma_min": self._minimum,
+            "sigma_max": self._maximum,
+            "sigma_mean": self._sum / self._count,
+            "sigma_fraction_near_floor": (
+                self._near_floor_count / self._count
+            ),
+        }
+        statistics.update({
+            f"sigma_{name}": value.item()
+            for name, value in zip(self._QUANTILES, quantile_values)
+        })
+        return statistics
+
+
 class Trainer:
     """Entraîne OmniAnomaly et valide une fois à la fin de chaque époque."""
 
@@ -166,6 +259,7 @@ class Trainer:
             "rejected_windows": len(batch_x) if batch_rejected else 0,
             "total_windows": len(batch_x),
             "batch_rejected": batch_rejected,
+            "sigma": components["sigma"],
         }
         if batch_rejected:
             return metrics
@@ -194,6 +288,9 @@ class Trainer:
     ) -> dict[str, float]:
         self._model.eval()
         totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
+        sigma_statistics = SigmaEpochStatistics(
+            near_floor_threshold=2.0 * self._model.config.std_epsilon,
+        )
         observations = 0
 
         for (batch_x,) in valid_iterator.get_iterator([valid_values]):
@@ -203,6 +300,7 @@ class Trainer:
                 n_z=self._valid_n_z,
             )
             self._check_loss(components["loss"])
+            sigma_statistics.update(components["sigma"])
             batch_size = len(batch_x)
             observations += batch_size
             for name in totals:
@@ -210,7 +308,11 @@ class Trainer:
 
         if observations == 0:
             raise ValueError("Aucun batch de validation n'a été produit")
-        return {name: value / observations for name, value in totals.items()}
+        metrics = {
+            name: value / observations for name, value in totals.items()
+        }
+        metrics.update(sigma_statistics.compute())
+        return metrics
 
     def fit(
         self,
@@ -299,6 +401,9 @@ class Trainer:
             self._epoch = epoch
 
             sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
+            train_sigma_statistics = SigmaEpochStatistics(
+                near_floor_threshold=2.0 * self._model.config.std_epsilon,
+            )
             observations = 0
             rejected_windows = 0
             total_windows = 0
@@ -312,6 +417,7 @@ class Trainer:
                 train_batch_times.append(perf_counter() - batch_start)
                 batch_size = len(batch_x)
                 if not step["batch_rejected"]:
+                    train_sigma_statistics.update(step["sigma"])
                     observations += batch_size
                     for name in sums:
                         sums[name] += step[name] * batch_size
@@ -363,6 +469,7 @@ class Trainer:
             train_metrics = {
                 name: value / observations for name, value in sums.items()
             }
+            train_metrics.update(train_sigma_statistics.compute())
             rejection_rate = rejected_windows / total_windows
             learning_rate = self._optimizer.param_groups[0]["lr"]
 
@@ -376,6 +483,26 @@ class Trainer:
                 f"valid_nll={valid_metrics['nll']:.6f} | "
                 f"valid_kl={valid_metrics['kl']:.6f} | "
                 f"valid_mse={valid_metrics['mse']:.6f} | "
+                f"train_sigma_min={train_metrics['sigma_min']:.6e} | "
+                f"train_sigma_p01={train_metrics['sigma_p01']:.6e} | "
+                f"train_sigma_p10={train_metrics['sigma_p10']:.6e} | "
+                f"train_sigma_median={train_metrics['sigma_median']:.6e} | "
+                f"train_sigma_mean={train_metrics['sigma_mean']:.6e} | "
+                f"train_sigma_p90={train_metrics['sigma_p90']:.6e} | "
+                f"train_sigma_p99={train_metrics['sigma_p99']:.6e} | "
+                f"train_sigma_max={train_metrics['sigma_max']:.6e} | "
+                f"train_sigma_fraction_near_floor="
+                f"{train_metrics['sigma_fraction_near_floor']:.2%} | "
+                f"valid_sigma_min={valid_metrics['sigma_min']:.6e} | "
+                f"valid_sigma_p01={valid_metrics['sigma_p01']:.6e} | "
+                f"valid_sigma_p10={valid_metrics['sigma_p10']:.6e} | "
+                f"valid_sigma_median={valid_metrics['sigma_median']:.6e} | "
+                f"valid_sigma_mean={valid_metrics['sigma_mean']:.6e} | "
+                f"valid_sigma_p90={valid_metrics['sigma_p90']:.6e} | "
+                f"valid_sigma_p99={valid_metrics['sigma_p99']:.6e} | "
+                f"valid_sigma_max={valid_metrics['sigma_max']:.6e} | "
+                f"valid_sigma_fraction_near_floor="
+                f"{valid_metrics['sigma_fraction_near_floor']:.2%} | "
                 f"learning_rate={learning_rate:.8f} | "
                 f"rejected_windows={rejection_rate:.2%}"
                 f" | rejected_batches={rejected_batches}/{epoch_batch_count}"
