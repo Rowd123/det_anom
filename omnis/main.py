@@ -140,6 +140,7 @@ def main(config) -> None:
         max_step=config.max_step,
         batch_size=config.batch_size,
         valid_batch_size=config.valid_batch_size,
+        train_log_step_freq=config.train_log_step_freq,
         initial_lr=config.initial_lr,
         lr_anneal_epochs=config.lr_anneal_epoch_freq,
         lr_anneal_factor=config.lr_anneal_factor,

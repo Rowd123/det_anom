@@ -26,6 +26,7 @@ class Trainer:
         max_step: Optional[int] = None,
         batch_size: int = 256,
         valid_batch_size: int = 1024,
+        train_log_step_freq: int = 100,
         initial_lr: float = 1e-3,
         lr_anneal_epochs: int = 10,
         lr_anneal_factor: float = 0.75,
@@ -50,6 +51,10 @@ class Trainer:
             raise ValueError("train_n_z et valid_n_z doivent être positifs")
         if batch_size < 1 or valid_batch_size < 1:
             raise ValueError("Les tailles de batch doivent être positives")
+        if train_log_step_freq < 1:
+            raise ValueError(
+                "train_log_step_freq doit être supérieur ou égal à 1"
+            )
         if early_stopping_validation_patience < 1:
             raise ValueError(
                 "early_stopping_validation_patience doit être positif"
@@ -66,6 +71,7 @@ class Trainer:
         self._max_step = max_step
         self._batch_size = batch_size
         self._valid_batch_size = valid_batch_size
+        self._train_log_step_freq = train_log_step_freq
         self._grad_clip_norm = grad_clip_norm
         self._check_numerics = check_numerics
         self._early_stopping_validation_patience = (
@@ -308,8 +314,10 @@ class Trainer:
             observations = 0
             rejected_windows = 0
             total_windows = 0
+            epoch_batch_count = len(train_sliding_window) // self._batch_size
 
-            for (batch_x,) in train_sliding_window.get_iterator([train_values]):
+            train_iterator = train_sliding_window.get_iterator([train_values])
+            for batch_index, (batch_x,) in enumerate(train_iterator, start=1):
                 batch_start = perf_counter()
                 step = self._training_step(batch_x, epoch)
                 train_batch_times.append(perf_counter() - batch_start)
@@ -319,6 +327,28 @@ class Trainer:
                     sums[name] += step[name] * batch_size
                 rejected_windows += step["rejected_windows"]
                 total_windows += step["total_windows"]
+
+                if (
+                    batch_index % self._train_log_step_freq == 0
+                    or batch_index == epoch_batch_count
+                ):
+                    running_metrics = {
+                        name: value / observations
+                        for name, value in sums.items()
+                    }
+                    print(
+                        f"Epoch {epoch:03d} | "
+                        f"batch={batch_index}/{epoch_batch_count} | "
+                        f"global_step={self._global_step} | "
+                        f"train_loss={running_metrics['loss']:.6f} | "
+                        f"train_nll={running_metrics['nll']:.6f} | "
+                        f"train_kl={running_metrics['kl']:.6f} | "
+                        f"rejected_windows="
+                        f"{rejected_windows / total_windows:.2%} | "
+                        f"learning_rate="
+                        f"{self._optimizer.param_groups[0]['lr']:.8f}",
+                        flush=True,
+                    )
 
                 if self._max_step is not None and self._global_step >= self._max_step:
                     should_stop = True
