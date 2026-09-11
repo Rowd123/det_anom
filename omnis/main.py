@@ -17,7 +17,7 @@ from eval import bf_search, pot_eval
 from model import OmniAnomaly
 from prediction import Predictor
 from trainer import Trainer
-from utils import get_data, get_data_dim, save_z
+from utils import get_data, save_z
 
 
 def load_config(path: str | Path) -> SimpleNamespace:
@@ -114,7 +114,7 @@ def main(config) -> None:
     (
         (x_train, _, x_train_exclude),
         (x_test, x_label, x_test_exclude),
-        _feature_representation,
+        feature_representation,
     ) = get_data(
         dataset=config.dataset,
         data_directory=config.data_dir,
@@ -123,6 +123,11 @@ def main(config) -> None:
         train_start=config.train_start,
         return_metadata=True,
     )
+    config.x_dim = feature_representation.model_dim
+
+    # Conserver la configuration réellement utilisée, dimension dérivée incluse.
+    with (result_directory / "config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(vars(config), file, sort_keys=False)
 
     # ------------------------------------------------------------
     # Modèle
@@ -157,7 +162,7 @@ def main(config) -> None:
         anomaly_filter_history_size=config.anomaly_filter_history_size,
         anomaly_filter_min_history=config.anomaly_filter_min_history,
         device=config.device,
-        feature_names=_feature_representation.model_names,
+        feature_names=feature_representation.model_names,
     )
 
     predictor = Predictor(
@@ -385,31 +390,8 @@ if __name__ == "__main__":
 
     print("GPU available: ", torch.cuda.is_available())
 
-    # x_dim dépend du dataset sélectionné.
-    config.x_dim = get_data_dim(
-        config.dataset
-    )
-
     print("=" * 30 + " Configuration " + "=" * 30)
     pprint(vars(config))
-
-    # Conserver une copie de la configuration réellement utilisée.
-    result_directory = Path(config.result_dir)
-    result_directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with (
-        result_directory / "config.yaml"
-    ).open("w", encoding="utf-8") as file:
-        yaml.safe_dump(
-            vars(config),
-            file,
-            sort_keys=False,
-        )
-
-
 
     torch.manual_seed(42)
     np.random.seed(42)
