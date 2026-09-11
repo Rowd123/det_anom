@@ -1,6 +1,7 @@
 # Dataset
 dataset: PMU
 data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
+# Dérivé à l'exécution de FeatureRepresentation (20 pour le PMU 14D actuel).
 x_dim: null
 
 # Architecture
@@ -21,7 +22,7 @@ nf_layers: 20
 std_epsilon: 0.0001
 
 # Entraînement
-run_mode: resume  # scratch, resume ou evaluate
+run_mode: scratch  # scratch, resume ou evaluate
 restore_checkpoint: model/best_omni_anomaly.pt
 max_epoch: 50
 max_step: null

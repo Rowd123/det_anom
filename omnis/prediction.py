@@ -125,6 +125,11 @@ class Predictor:
             raise ValueError(
                 "values doit avoir la forme [temps, x_dim]"
             )
+        if values.shape[1] != self.model.x_dims:
+            raise ValueError(
+                f"values contient {values.shape[1]} dimensions, "
+                f"mais le modèle en attend {self.model.x_dims}"
+            )
 
         if len(values) < self.model.window_length:
             raise ValueError(

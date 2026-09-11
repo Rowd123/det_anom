@@ -22,10 +22,22 @@ DATA_DIMENSIONS = {
 class PhasorFeatureMapping:
     amplitude_name: str
     phase_name: str
-    real_name: str
-    imag_name: str
-    amplitude_index: int
-    phase_index: int
+    model_amplitude_name: str
+    phase_cos_name: str
+    phase_sin_name: str
+    physical_amplitude_index: int
+    physical_phase_index: int
+    model_amplitude_index: int
+    model_phase_cos_index: int
+    model_phase_sin_index: int
+
+
+@dataclass(frozen=True)
+class DirectFeatureMapping:
+    physical_name: str
+    model_name: str
+    physical_index: int
+    model_index: int
 
 
 @dataclass(frozen=True)
@@ -34,7 +46,16 @@ class FeatureRepresentation:
 
     original_names: tuple[str, ...]
     model_names: tuple[str, ...]
+    direct_features: tuple[DirectFeatureMapping, ...]
     phasors: tuple[PhasorFeatureMapping, ...]
+
+    @property
+    def physical_dim(self) -> int:
+        return len(self.original_names)
+
+    @property
+    def model_dim(self) -> int:
+        return len(self.model_names)
 
 
 PMU_FIRST_PHASOR_INDEX = 2
@@ -68,80 +89,113 @@ def build_feature_representation(column_names) -> FeatureRepresentation:
             "couples amplitude/phase"
         )
 
-    model_names = [_readable_feature_name(name) for name in original_names]
+    model_names = []
+    direct_features = []
+    for physical_index, name in enumerate(original_names[:PMU_FIRST_PHASOR_INDEX]):
+        model_index = len(model_names)
+        model_name = _readable_feature_name(name)
+        model_names.append(model_name)
+        direct_features.append(DirectFeatureMapping(
+            physical_name=name,
+            model_name=model_name,
+            physical_index=physical_index,
+            model_index=model_index,
+        ))
     phasors = []
-    for amplitude_index in range(
+    for physical_amplitude_index in range(
         PMU_FIRST_PHASOR_INDEX,
         len(original_names),
         2,
     ):
-        phase_index = amplitude_index + 1
-        amplitude_name = original_names[amplitude_index]
-        phase_name = original_names[phase_index]
+        physical_phase_index = physical_amplitude_index + 1
+        amplitude_name = original_names[physical_amplitude_index]
+        phase_name = original_names[physical_phase_index]
         readable_stem = _readable_feature_name(
             _phasor_name(amplitude_name, phase_name)
         )
+        model_amplitude_index = len(model_names)
+        model_phase_cos_index = model_amplitude_index + 1
+        model_phase_sin_index = model_amplitude_index + 2
         mapping = PhasorFeatureMapping(
             amplitude_name=amplitude_name,
             phase_name=phase_name,
-            real_name=f"{readable_stem}_real",
-            imag_name=f"{readable_stem}_imag",
-            amplitude_index=amplitude_index,
-            phase_index=phase_index,
+            model_amplitude_name=f"{readable_stem}_mag",
+            phase_cos_name=f"{readable_stem}_phase_cos",
+            phase_sin_name=f"{readable_stem}_phase_sin",
+            physical_amplitude_index=physical_amplitude_index,
+            physical_phase_index=physical_phase_index,
+            model_amplitude_index=model_amplitude_index,
+            model_phase_cos_index=model_phase_cos_index,
+            model_phase_sin_index=model_phase_sin_index,
         )
         phasors.append(mapping)
-        model_names[amplitude_index] = mapping.real_name
-        model_names[phase_index] = mapping.imag_name
+        model_names.extend((
+            mapping.model_amplitude_name,
+            mapping.phase_cos_name,
+            mapping.phase_sin_name,
+        ))
     return FeatureRepresentation(
         original_names=original_names,
         model_names=tuple(model_names),
+        direct_features=tuple(direct_features),
         phasors=tuple(phasors),
     )
 
 
-def phasor_to_cartesian(data, representation: FeatureRepresentation):
-    """Convertit les MAG/ANG physiques (degrés) en Re/Im physiques."""
+def phasor_to_phase_embedding(data, representation: FeatureRepresentation):
+    """Développe les données physiques en (amplitude, cos phase, sin phase)."""
     is_tensor = isinstance(data, Tensor)
-    values = torch.as_tensor(data).clone() if is_tensor else np.array(data, copy=True)
+    if data.shape[-1] != representation.physical_dim:
+        raise ValueError("La dernière dimension ne correspond pas aux données physiques")
+    shape = (*data.shape[:-1], representation.model_dim)
+    values = data.new_empty(shape) if is_tensor else np.empty(shape, dtype=data.dtype)
+    for feature in representation.direct_features:
+        values[..., feature.model_index] = data[..., feature.physical_index]
     for phasor in representation.phasors:
         if is_tensor:
-            amplitude = values[..., phasor.amplitude_index].clone()
-            phase = values[..., phasor.phase_index].clone()
+            amplitude = data[..., phasor.physical_amplitude_index]
+            phase = data[..., phasor.physical_phase_index]
             radians = torch.deg2rad(phase)
-            real, imag = amplitude * torch.cos(radians), amplitude * torch.sin(radians)
+            cosine, sine = torch.cos(radians), torch.sin(radians)
         else:
-            amplitude = values[..., phasor.amplitude_index].copy()
-            phase = values[..., phasor.phase_index].copy()
+            amplitude = data[..., phasor.physical_amplitude_index]
+            phase = data[..., phasor.physical_phase_index]
             radians = np.deg2rad(phase)
-            real, imag = amplitude * np.cos(radians), amplitude * np.sin(radians)
-        values[..., phasor.amplitude_index] = real
-        values[..., phasor.phase_index] = imag
+            cosine, sine = np.cos(radians), np.sin(radians)
+        values[..., phasor.model_amplitude_index] = amplitude
+        values[..., phasor.model_phase_cos_index] = cosine
+        values[..., phasor.model_phase_sin_index] = sine
     return values
 
 
-def cartesian_to_phasor(data, representation: FeatureRepresentation):
-    """Restaure amplitude et phase en degrés dans [-180, 180]."""
+def phase_embedding_to_phasor(data, representation: FeatureRepresentation):
+    """Restaure les 14 variables physiques depuis la représentation modèle."""
     is_tensor = isinstance(data, Tensor)
-    values = torch.as_tensor(data).clone() if is_tensor else np.array(data, copy=True)
+    if data.shape[-1] != representation.model_dim:
+        raise ValueError("La dernière dimension ne correspond pas à la représentation modèle")
+    shape = (*data.shape[:-1], representation.physical_dim)
+    values = data.new_empty(shape) if is_tensor else np.empty(shape, dtype=data.dtype)
+    for feature in representation.direct_features:
+        values[..., feature.physical_index] = data[..., feature.model_index]
     for phasor in representation.phasors:
         if is_tensor:
-            real = values[..., phasor.amplitude_index].clone()
-            imag = values[..., phasor.phase_index].clone()
-            amplitude = torch.sqrt(real.square() + imag.square())
-            phase = torch.rad2deg(torch.atan2(imag, real))
+            amplitude = data[..., phasor.model_amplitude_index]
+            cosine = data[..., phasor.model_phase_cos_index]
+            sine = data[..., phasor.model_phase_sin_index]
+            phase = torch.rad2deg(torch.atan2(sine, cosine))
         else:
-            real = values[..., phasor.amplitude_index].copy()
-            imag = values[..., phasor.phase_index].copy()
-            amplitude = np.sqrt(np.square(real) + np.square(imag))
-            phase = np.rad2deg(np.arctan2(imag, real))
-        values[..., phasor.amplitude_index] = amplitude
-        values[..., phasor.phase_index] = phase
+            amplitude = data[..., phasor.model_amplitude_index]
+            cosine = data[..., phasor.model_phase_cos_index]
+            sine = data[..., phasor.model_phase_sin_index]
+            phase = np.rad2deg(np.arctan2(sine, cosine))
+        values[..., phasor.physical_amplitude_index] = amplitude
+        values[..., phasor.physical_phase_index] = phase
     return values
 
 
 def inverse_transform_physical(data, scaler, representation: FeatureRepresentation):
-    """Annule le scaling cartésien avant de revenir aux grandeurs physiques."""
-    return cartesian_to_phasor(scaler.inverse_transform(data), representation)
+    """Annule le scaling modèle, puis restaure les grandeurs physiques."""
+    return phase_embedding_to_phasor(scaler.inverse_transform(data), representation)
 
 
 class MinMaxScaler:
@@ -227,6 +281,21 @@ class MinMaxScaler:
             raise RuntimeError("Le scaler doit être ajusté ou restauré avant utilisation")
 
 
+def validate_checkpoint_model_dimension(checkpoint: dict, expected_dim: int) -> None:
+    """Refuse explicitement les checkpoints d'une autre représentation."""
+    saved_dim = checkpoint.get("model_x_dim")
+    scaler_state = checkpoint.get("scaler_state_dict")
+    if saved_dim is None and scaler_state is not None and "minimum" in scaler_state:
+        saved_dim = int(torch.as_tensor(scaler_state["minimum"]).shape[-1])
+    if saved_dim is not None and saved_dim != expected_dim:
+        raise ValueError(
+            "Checkpoint incompatible : il utilise une représentation de "
+            f"dimension {saved_dim}, tandis que le modèle courant attend "
+            f"{expected_dim} dimensions (amplitude/cosinus/sinus). "
+            "Conservez ce checkpoint séparément et relancez en mode scratch."
+        )
+
+
 def notre_data_tri(data_file_path):
     df = pd.read_csv(data_file_path, sep=";")
 
@@ -262,9 +331,9 @@ def notre_data_tri(data_file_path):
     finite_rows = np.isfinite(data).all(axis=1)
     excluded = np.asarray(excluded, dtype=bool) | ~finite_rows
 
-    # Aucune substitution : si MAG ou ANG est invalide, Re et Im le restent et
+    # Aucune substitution : si MAG ou ANG est invalide, l'embedding le reste et
     # la ligne demeure exclue par le masque calculé ci-dessus.
-    data = phasor_to_cartesian(data, representation)
+    data = phasor_to_phase_embedding(data, representation)
     excluded |= ~np.isfinite(data).all(axis=1)
 
     return data, excluded, representation
@@ -421,13 +490,14 @@ def get_data(
 
     DATA, excluded, representation = get_data_simple(data_directory)
 
-    x_dim = get_data_dim(dataset)
-    if DATA.ndim != 2 or DATA.shape[1] != x_dim:
+    physical_dim = get_data_dim(dataset)
+    if representation.physical_dim != physical_dim:
         raise ValueError(
-            f"Le dataset {dataset} doit contenir {x_dim} variables, "
-            "mais le fichier en contient "
-            f"{DATA.shape[1] if DATA.ndim == 2 else 'un nombre invalide'}"
+            f"Le dataset {dataset} doit contenir {physical_dim} variables "
+            f"physiques, mais le fichier en contient {representation.physical_dim}"
         )
+    if DATA.ndim != 2 or DATA.shape[1] != representation.model_dim:
+        raise ValueError("La transformation PMU a produit une dimension invalide")
 
     if max_train_size is None:
         train_size = DATA.shape[0] - train_start
