@@ -3,7 +3,7 @@ dataset: PMU
 data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
 # Suffixes ordonnés des noms réels du CSV (le préfixe de poste est conservé).
 data_column_order:
-  - ROCOF
+  - DFDT
   - FREQ
   - I0.ANG
   - I0.MAG
@@ -18,7 +18,7 @@ data_column_order:
   - V2.ANG
   - V2.MAG
 x_dim: null  # dérivé de la représentation au chargement
-exclude_zero_sequence_phase: true
+exclude_zero_sequence_phase: false
 
 # Architecture du checkpoint
 use_connected_z_q: true
