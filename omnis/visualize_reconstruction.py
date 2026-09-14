@@ -2,7 +2,7 @@
 
 Exemples (depuis la racine du dépôt) :
 
-    python omnis/visualize_reconstruction.py --backend matplotlib
+    python omnis/visualize_reconstruction.py
     python omnis/visualize_reconstruction.py --backend plotly --split train
 """
 
@@ -33,6 +33,22 @@ def load_config(path: Path) -> SimpleNamespace:
 def resolve_from_config(path: str | Path, config_path: Path) -> Path:
     path = Path(path)
     return path if path.is_absolute() else config_path.parent / path
+
+
+def configured_value(arguments, config, name):
+    """Donne la priorité à la CLI, puis à la configuration de visualisation."""
+    argument_value = getattr(arguments, name)
+    return argument_value if argument_value is not None else getattr(config, name)
+
+
+def physical_reconstruction_indices(representation):
+    """Retourne uniquement les grandeurs physiques réellement reconstructibles."""
+    indices = [feature.physical_index for feature in representation.direct_features]
+    for phasor in representation.phasors:
+        indices.append(phasor.physical_amplitude_index)
+        if phasor.includes_phase:
+            indices.append(phasor.physical_phase_index)
+    return indices
 
 
 @torch.inference_mode()
@@ -171,10 +187,23 @@ def plot_plotly(x, observed, reconstructed, names, mse, output_path):
 
 
 def main(arguments):
-    if arguments.points < 1 or arguments.batch_size < 1 or arguments.n_z < 1:
-        raise ValueError("points, batch-size et n-z doivent être positifs")
     config_path = Path(arguments.config).resolve()
     config = load_config(config_path)
+    split = configured_value(arguments, config, "split")
+    start = configured_value(arguments, config, "start")
+    points = configured_value(arguments, config, "points")
+    batch_size = configured_value(arguments, config, "batch_size")
+    n_z = configured_value(arguments, config, "n_z")
+    backend = configured_value(arguments, config, "backend")
+    output = configured_value(arguments, config, "output")
+    device_name = configured_value(arguments, config, "device")
+    checkpoint = configured_value(arguments, config, "checkpoint")
+    if points < 1 or batch_size < 1 or n_z < 1:
+        raise ValueError("points, batch-size et n-z doivent être positifs")
+    if split not in {"train", "test"}:
+        raise ValueError("split doit valoir 'train' ou 'test'")
+    if backend not in {"matplotlib", "plotly"}:
+        raise ValueError("backend doit valoir 'matplotlib' ou 'plotly'")
     data_path = resolve_from_config(config.data_dir, config_path)
     train, test, representation = get_data(
         dataset=config.dataset,
@@ -184,23 +213,25 @@ def main(arguments):
         train_start=config.train_start,
         print_log=False,
         return_metadata=True,
+        exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
     )
-    values, _, excludes = train if arguments.split == "train" else test
+    values, _, excludes = train if split == "train" else test
     if values is None:
-        raise ValueError(f"La partie {arguments.split} est vide")
+        raise ValueError(f"La partie {split} est vide")
     config.x_dim = representation.model_dim
 
-    checkpoint = arguments.checkpoint
-    if checkpoint is None:
-        checkpoint = Path(config.save_dir) / "best_omni_anomaly.pt"
     checkpoint_path = resolve_from_config(checkpoint, config_path)
     device = torch.device(
-        arguments.device
-        if arguments.device is not None
+        device_name
+        if device_name is not None
         else "cuda" if torch.cuda.is_available() else "cpu"
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    validate_checkpoint_model_dimension(state, config.x_dim)
+    validate_checkpoint_model_dimension(
+        state,
+        config.x_dim,
+        expected_feature_names=representation.model_names,
+    )
     model = OmniAnomaly(config).to(device)
     model.load_state_dict(state["model_state_dict"])
     scaler = MinMaxScaler().load_state_dict(state["scaler_state_dict"])
@@ -210,10 +241,10 @@ def main(arguments):
         model=model,
         normalized_values=normalized_values,
         excludes=excludes,
-        start=arguments.start,
-        point_count=arguments.points,
-        batch_size=arguments.batch_size,
-        n_z=arguments.n_z,
+        start=start,
+        point_count=points,
+        batch_size=batch_size,
+        n_z=n_z,
         device=device,
     )
     selected_values = values[indices]
@@ -225,24 +256,30 @@ def main(arguments):
     ).numpy()
     mse = physical_squared_errors(observed, reconstructed, representation)
 
-    suffix = ".png" if arguments.backend == "matplotlib" else ".html"
-    output = arguments.output or f"reconstruction_{arguments.split}{suffix}"
+    physical_indices = physical_reconstruction_indices(representation)
+    observed = observed[:, physical_indices]
+    reconstructed = reconstructed[:, physical_indices]
+    mse = mse[physical_indices]
+    names = [representation.original_names[index] for index in physical_indices]
+
+    suffix = ".png" if backend == "matplotlib" else ".html"
+    output = output or f"reconstruction_{split}{suffix}"
     output_path = Path(output)
     if output_path.suffix.lower() != suffix:
         raise ValueError(
-            f"Le backend {arguments.backend} exige l'extension {suffix}"
+            f"Le backend {backend} exige l'extension {suffix}"
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plot_function = (
         plot_matplotlib
-        if arguments.backend == "matplotlib"
+        if backend == "matplotlib"
         else plot_plotly
     )
     plot_function(
         indices.numpy(),
         observed,
         reconstructed,
-        representation.original_names,
+        names,
         mse,
         output_path,
     )
@@ -252,18 +289,17 @@ def main(arguments):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="omnis/config.yaml")
+    parser.add_argument("--config", default="omnis/visualize_config.yaml")
     parser.add_argument("--checkpoint")
-    parser.add_argument("--split", choices=("train", "test"), default="test")
-    parser.add_argument("--start", type=int, default=99)
-    parser.add_argument("--points", type=int, default=1000)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--n-z", type=int, default=16)
+    parser.add_argument("--split", choices=("train", "test"))
+    parser.add_argument("--start", type=int)
+    parser.add_argument("--points", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--n-z", type=int)
     parser.add_argument("--device")
     parser.add_argument(
         "--backend",
         choices=("matplotlib", "plotly"),
-        default="matplotlib",
     )
     parser.add_argument("--output")
     main(parser.parse_args())
