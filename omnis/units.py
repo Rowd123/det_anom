@@ -127,25 +127,35 @@ class DistributionParameterNetwork(nn.Module):
         hidden_dim: int,
         output_dim: int,
         std_epsilon: float = 1e-5,
+        sigma_mode: str = "learned",
+        fixed_sigma: float | None = None,
     ):
         super().__init__()
 
         self.hidden_network = hidden_network
         self.mean_layer = nn.Linear(hidden_dim, output_dim)
 
-        self.std_layer = SoftplusStd(
-            input_dim=hidden_dim,
-            output_dim=output_dim,
-            epsilon=std_epsilon,
+        if sigma_mode not in {"learned", "fixed"}:
+            raise ValueError("sigma_mode doit valoir 'learned' ou 'fixed'")
+        if sigma_mode == "fixed" and (fixed_sigma is None or fixed_sigma <= 0):
+            raise ValueError("fixed_sigma doit être strictement positif")
+        self.sigma_mode = sigma_mode
+        self.fixed_sigma = fixed_sigma
+        self.std_layer = (
+            SoftplusStd(hidden_dim, output_dim, std_epsilon)
+            if sigma_mode == "learned" else None
         )
 
     def forward(self, inputs: Tensor) -> dict[str, Tensor]:
         hidden = self.hidden_network(inputs)
 
-        return {
-            "loc": self.mean_layer(hidden),
-            "scale": self.std_layer(hidden),
-        }
+        loc = self.mean_layer(hidden)
+        scale = (
+            self.std_layer(hidden)
+            if self.std_layer is not None
+            else torch.full_like(loc, self.fixed_sigma)
+        )
+        return {"loc": loc, "scale": scale}
 
 
 class RecurrentPosteriorInputNetwork(nn.Module):
