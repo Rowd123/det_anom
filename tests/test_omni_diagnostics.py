@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "omnis"))
 
 from model import OmniAnomaly
 from units import DistributionParameterNetwork
+from trainer import SigmaEpochStatistics
 
 
 class IdentityHidden(torch.nn.Module):
@@ -38,9 +39,9 @@ def test_learned_decoder_keeps_softplus_floor_behavior():
     assert parameters["scale"].requires_grad
 
 
-def _config(mode="fixed"):
+def _config(mode="fixed", x_dim=2):
     return SimpleNamespace(
-        window_length=4, x_dim=2, z_dim=2, rnn_num_hidden=3, dense_dim=3,
+        window_length=4, x_dim=x_dim, z_dim=2, rnn_num_hidden=3, dense_dim=3,
         use_connected_z_q=True, use_connected_z_p=True, std_epsilon=0.005,
         decoder_sigma_mode=mode, decoder_fixed_sigma=0.05,
         get_score_on_dim=False,
@@ -68,3 +69,21 @@ def test_loss_diagnostics_are_finite_detached_and_preserve_decoder_gradients(mod
     metrics["loss"].mean().backward()
     assert model.decoder.mean_layer.weight.grad is not None
     assert torch.isfinite(model.decoder.mean_layer.weight.grad).all()
+
+
+def test_training_diagnostics_accept_reduced_feature_dimension():
+    names = tuple(f"feature_{index}" for index in range(16))
+    model = OmniAnomaly(_config(x_dim=len(names)))
+    components = model.get_per_window_loss(torch.randn(3, 4, len(names)), n_z=2)
+    assert components["nll_by_feature"].shape == (3, len(names))
+    assert torch.isfinite(components["loss"]).all()
+    components["loss"].mean().backward()
+
+    statistics = SigmaEpochStatistics(near_floor_threshold=0.01, feature_names=names)
+    statistics.update(torch.full((2, 3, 4, 16), 0.05))
+    metrics = statistics.compute()
+    assert set(metrics["sigma_by_feature"]) == set(names)
+    assert all(
+        feature_metrics["sigma_mean"] == pytest.approx(0.05)
+        for feature_metrics in metrics["sigma_by_feature"].values()
+    )

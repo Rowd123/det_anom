@@ -122,8 +122,29 @@ def main(config) -> None:
         max_test_size=config.max_test_size,
         train_start=config.train_start,
         return_metadata=True,
+        exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
     )
     config.x_dim = feature_representation.model_dim
+
+    print(f"Physical dimension: {feature_representation.physical_dim}")
+    print(f"Model dimension: {feature_representation.model_dim}")
+    print("\nPhysical phasors:")
+    for phasor in feature_representation.phasors:
+        sequence = (
+            f"sequence {phasor.sequence}"
+            if phasor.sequence is not None
+            else "unclassified"
+        )
+        print(f"- {phasor.amplitude_name} / {phasor.phase_name}: {sequence}")
+    print("\nModel features:")
+    for feature_name in feature_representation.model_names:
+        print(f"- {feature_name}")
+    print("\nExcluded from model representation:")
+    if feature_representation.excluded_model_names:
+        for feature_name in feature_representation.excluded_model_names:
+            print(f"- {feature_name}")
+    else:
+        print("- none")
 
     # Conserver la configuration réellement utilisée, dimension dérivée incluse.
     with (result_directory / "config.yaml").open("w", encoding="utf-8") as file:

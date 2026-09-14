@@ -680,7 +680,8 @@ class Trainer:
                 "scaler_state_dict": self.scaler.state_dict(),
                 "loss_history": list(self._loss_history),
                 "model_x_dim": self._model.x_dims,
-                "feature_representation": "amplitude_phase_cos_sin_v1",
+                "feature_representation": "optional_zero_sequence_phase_v2",
+                "model_feature_names": self._feature_names,
             },
             path,
         )
@@ -697,7 +698,11 @@ class Trainer:
                 "une reprise ou une inférence sûre"
             )
 
-        validate_checkpoint_model_dimension(checkpoint, self._model.x_dims)
+        validate_checkpoint_model_dimension(
+            checkpoint,
+            self._model.x_dims,
+            expected_feature_names=self._feature_names,
+        )
 
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
