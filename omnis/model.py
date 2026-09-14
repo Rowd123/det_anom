@@ -126,6 +126,8 @@ class OmniAnomaly(nn.Module):
             hidden_dim=config.dense_dim,
             output_dim=config.x_dim,
             std_epsilon=config.std_epsilon,
+            sigma_mode=config.decoder_sigma_mode,
+            fixed_sigma=config.decoder_fixed_sigma,
         )
 
         # ------------------------------------------------------------

@@ -4,6 +4,7 @@ import torch
 from torch import Tensor
 
 import pickle
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -28,8 +29,13 @@ class PhasorFeatureMapping:
     physical_amplitude_index: int
     physical_phase_index: int
     model_amplitude_index: int
-    model_phase_cos_index: int
-    model_phase_sin_index: int
+    model_phase_cos_index: Optional[int]
+    model_phase_sin_index: Optional[int]
+    sequence: Optional[int]
+
+    @property
+    def includes_phase(self) -> bool:
+        return self.model_phase_cos_index is not None
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,7 @@ class FeatureRepresentation:
     model_names: tuple[str, ...]
     direct_features: tuple[DirectFeatureMapping, ...]
     phasors: tuple[PhasorFeatureMapping, ...]
+    excluded_model_names: tuple[str, ...]
 
     @property
     def physical_dim(self) -> int:
@@ -79,7 +86,27 @@ def _phasor_name(amplitude_name: str, phase_name: str) -> str:
     return common_name or amplitude_name
 
 
-def build_feature_representation(column_names) -> FeatureRepresentation:
+_SEQUENCE_PATTERN = re.compile(r"(?:^|[^A-Z0-9])(?:V|I)([012])(?:[^A-Z0-9]|$)", re.I)
+
+
+def _phasor_sequence(amplitude_name: str, phase_name: str) -> Optional[int]:
+    """Identifie explicitement V0/V1/V2/I0/I1/I2 dans les noms du phasor."""
+    sequences = {
+        int(match.group(1))
+        for name in (amplitude_name, phase_name)
+        for match in _SEQUENCE_PATTERN.finditer(name)
+    }
+    if len(sequences) > 1:
+        raise ValueError(
+            f"Séquences incohérentes pour le couple {amplitude_name!r}, {phase_name!r}"
+        )
+    return next(iter(sequences), None)
+
+
+def build_feature_representation(
+    column_names,
+    exclude_zero_sequence_phase: bool = False,
+) -> FeatureRepresentation:
     """Décrit tous les couples PMU (2, 3), (4, 5), ..., dans l'ordre du CSV."""
     original_names = tuple(str(name) for name in column_names)
     phasor_feature_count = len(original_names) - PMU_FIRST_PHASOR_INDEX
@@ -102,6 +129,7 @@ def build_feature_representation(column_names) -> FeatureRepresentation:
             model_index=model_index,
         ))
     phasors = []
+    excluded_model_names = []
     for physical_amplitude_index in range(
         PMU_FIRST_PHASOR_INDEX,
         len(original_names),
@@ -113,9 +141,11 @@ def build_feature_representation(column_names) -> FeatureRepresentation:
         readable_stem = _readable_feature_name(
             _phasor_name(amplitude_name, phase_name)
         )
+        sequence = _phasor_sequence(amplitude_name, phase_name)
+        include_phase = not (exclude_zero_sequence_phase and sequence == 0)
         model_amplitude_index = len(model_names)
-        model_phase_cos_index = model_amplitude_index + 1
-        model_phase_sin_index = model_amplitude_index + 2
+        model_phase_cos_index = len(model_names) + 1 if include_phase else None
+        model_phase_sin_index = len(model_names) + 2 if include_phase else None
         mapping = PhasorFeatureMapping(
             amplitude_name=amplitude_name,
             phase_name=phase_name,
@@ -127,18 +157,20 @@ def build_feature_representation(column_names) -> FeatureRepresentation:
             model_amplitude_index=model_amplitude_index,
             model_phase_cos_index=model_phase_cos_index,
             model_phase_sin_index=model_phase_sin_index,
+            sequence=sequence,
         )
         phasors.append(mapping)
-        model_names.extend((
-            mapping.model_amplitude_name,
-            mapping.phase_cos_name,
-            mapping.phase_sin_name,
-        ))
+        model_names.append(mapping.model_amplitude_name)
+        if include_phase:
+            model_names.extend((mapping.phase_cos_name, mapping.phase_sin_name))
+        else:
+            excluded_model_names.extend((mapping.phase_cos_name, mapping.phase_sin_name))
     return FeatureRepresentation(
         original_names=original_names,
         model_names=tuple(model_names),
         direct_features=tuple(direct_features),
         phasors=tuple(phasors),
+        excluded_model_names=tuple(excluded_model_names),
     )
 
 
@@ -152,19 +184,19 @@ def phasor_to_phase_embedding(data, representation: FeatureRepresentation):
     for feature in representation.direct_features:
         values[..., feature.model_index] = data[..., feature.physical_index]
     for phasor in representation.phasors:
-        if is_tensor:
-            amplitude = data[..., phasor.physical_amplitude_index]
+        amplitude = data[..., phasor.physical_amplitude_index]
+        values[..., phasor.model_amplitude_index] = amplitude
+        if phasor.includes_phase and is_tensor:
             phase = data[..., phasor.physical_phase_index]
             radians = torch.deg2rad(phase)
             cosine, sine = torch.cos(radians), torch.sin(radians)
-        else:
-            amplitude = data[..., phasor.physical_amplitude_index]
+        elif phasor.includes_phase:
             phase = data[..., phasor.physical_phase_index]
             radians = np.deg2rad(phase)
             cosine, sine = np.cos(radians), np.sin(radians)
-        values[..., phasor.model_amplitude_index] = amplitude
-        values[..., phasor.model_phase_cos_index] = cosine
-        values[..., phasor.model_phase_sin_index] = sine
+        if phasor.includes_phase:
+            values[..., phasor.model_phase_cos_index] = cosine
+            values[..., phasor.model_phase_sin_index] = sine
     return values
 
 
@@ -178,18 +210,19 @@ def phase_embedding_to_phasor(data, representation: FeatureRepresentation):
     for feature in representation.direct_features:
         values[..., feature.physical_index] = data[..., feature.model_index]
     for phasor in representation.phasors:
-        if is_tensor:
-            amplitude = data[..., phasor.model_amplitude_index]
+        amplitude = data[..., phasor.model_amplitude_index]
+        if phasor.includes_phase and is_tensor:
             cosine = data[..., phasor.model_phase_cos_index]
             sine = data[..., phasor.model_phase_sin_index]
             phase = torch.rad2deg(torch.atan2(sine, cosine))
-        else:
-            amplitude = data[..., phasor.model_amplitude_index]
+        elif phasor.includes_phase:
             cosine = data[..., phasor.model_phase_cos_index]
             sine = data[..., phasor.model_phase_sin_index]
             phase = np.rad2deg(np.arctan2(sine, cosine))
         values[..., phasor.physical_amplitude_index] = amplitude
-        values[..., phasor.physical_phase_index] = phase
+        # Une phase volontairement absente n'est pas reconstructible. Zéro est
+        # un placeholder fini et explicite, plutôt qu'une valeur issue du modèle.
+        values[..., phasor.physical_phase_index] = phase if phasor.includes_phase else 0.0
     return values
 
 
@@ -281,7 +314,11 @@ class MinMaxScaler:
             raise RuntimeError("Le scaler doit être ajusté ou restauré avant utilisation")
 
 
-def validate_checkpoint_model_dimension(checkpoint: dict, expected_dim: int) -> None:
+def validate_checkpoint_model_dimension(
+    checkpoint: dict,
+    expected_dim: int,
+    expected_feature_names=None,
+) -> None:
     """Refuse explicitement les checkpoints d'une autre représentation."""
     saved_dim = checkpoint.get("model_x_dim")
     scaler_state = checkpoint.get("scaler_state_dict")
@@ -294,9 +331,16 @@ def validate_checkpoint_model_dimension(checkpoint: dict, expected_dim: int) -> 
             f"{expected_dim} dimensions (amplitude/cosinus/sinus). "
             "Conservez ce checkpoint séparément et relancez en mode scratch."
         )
+    saved_feature_names = checkpoint.get("model_feature_names")
+    if (
+        saved_feature_names is not None
+        and expected_feature_names is not None
+        and tuple(saved_feature_names) != tuple(expected_feature_names)
+    ):
+        raise ValueError("Checkpoint incompatible : les features modèle diffèrent")
 
 
-def notre_data_tri(data_file_path):
+def notre_data_tri(data_file_path, exclude_zero_sequence_phase: bool = False):
     df = pd.read_csv(data_file_path, sep=";")
 
     df["DATE_MESURE"] = pd.to_datetime(df["DATE_MESURE"])
@@ -323,7 +367,10 @@ def notre_data_tri(data_file_path):
 
     df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
 
-    representation = build_feature_representation(df.columns)
+    representation = build_feature_representation(
+        df.columns,
+        exclude_zero_sequence_phase=exclude_zero_sequence_phase,
+    )
     data = df.to_numpy(dtype=np.float64)
 
     # Les valeurs non finies ne doivent ni ajuster le scaler ni entrer dans
@@ -339,9 +386,9 @@ def notre_data_tri(data_file_path):
     return data, excluded, representation
 
 
-def get_data_simple(data_file_path):
+def get_data_simple(data_file_path, exclude_zero_sequence_phase: bool = False):
     """Charge un CSV PMU avec exactement la même représentation que get_data."""
-    return notre_data_tri(data_file_path)
+    return notre_data_tri(data_file_path, exclude_zero_sequence_phase)
 
 
 def to_numpy(data) -> np.ndarray:
@@ -456,6 +503,7 @@ def get_data(
         do_preprocess: bool = True,
         train_start: int = 0,
         return_metadata: bool = False,
+        exclude_zero_sequence_phase: bool = False,
 ):
     """
     Charge les données d'entraînement et de test.
@@ -488,7 +536,10 @@ def get_data(
             "max_test_size doit être positif ou None"
         )
 
-    DATA, excluded, representation = get_data_simple(data_directory)
+    DATA, excluded, representation = get_data_simple(
+        data_directory,
+        exclude_zero_sequence_phase=exclude_zero_sequence_phase,
+    )
 
     physical_dim = get_data_dim(dataset)
     if representation.physical_dim != physical_dim:

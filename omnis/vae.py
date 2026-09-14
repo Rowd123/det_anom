@@ -1,4 +1,5 @@
 # vae.py
+from math import log, pi
 from typing import Callable, Optional
 
 import torch
@@ -411,7 +412,24 @@ class VAE(nn.Module):
                     "p(x | z) doit exposer le scale de sa loi normale"
                 )
             likelihood_base = likelihood_base.base_dist
-        sigma = likelihood_base.scale.detach()
+        # Pour Normal(mu, sigma), par cellule :
+        # -log p(x|z) = log(sigma) + 0.5*((x-mu)/sigma)^2 + 0.5*log(2*pi).
+        # Ces vues par feature sont moyennées sur MC, puis sommées sur le temps.
+        # no_grad garantit que l'instrumentation ne prolonge pas le graphe.
+        with torch.no_grad():
+            sigma = likelihood_base.scale.detach()
+            loc = likelihood_base.loc.detach()
+            standardized_squared_error = ((x - loc) / sigma).square()
+            nll_log_sigma_by_feature = torch.log(sigma).mean(dim=0).sum(dim=1)
+            standardized_squared_error_by_feature = (
+                standardized_squared_error.mean(dim=0).sum(dim=1)
+            )
+            nll_by_feature = (
+                nll_log_sigma_by_feature
+                + 0.5 * standardized_squared_error_by_feature
+                + x.shape[-2] * 0.5 * log(2.0 * pi)
+            )
+            mse_by_feature = (loc - x).square().mean(dim=0).mean(dim=1)
 
         log_px = likelihood.log_prob(x)
         log_pz = prior.log_prob(z)
@@ -430,6 +448,16 @@ class VAE(nn.Module):
             # Vue détachée du scale de likelihood : le Trainer peut ainsi
             # instrumenter sigma sans conserver ni modifier le graphe de loss.
             "sigma": sigma,
+            "nll_log_sigma": nll_log_sigma_by_feature.sum(dim=-1).detach(),
+            "standardized_squared_error": (
+                standardized_squared_error_by_feature.sum(dim=-1).detach()
+            ),
+            "nll_by_feature": nll_by_feature.detach(),
+            "nll_log_sigma_by_feature": nll_log_sigma_by_feature.detach(),
+            "standardized_squared_error_by_feature": (
+                standardized_squared_error_by_feature.detach()
+            ),
+            "mse_by_feature": mse_by_feature.detach(),
         }
 
     def make_svi(
