@@ -28,10 +28,12 @@ class SigmaEpochStatistics:
     def __init__(
         self,
         near_floor_threshold: float,
+        feature_names=None,
         reservoir_size: int = 65536,
         batch_sample_size: int = 4096,
     ):
         self._near_floor_threshold = near_floor_threshold
+        self._feature_names = tuple(feature_names or ())
         self._reservoir_size = reservoir_size
         self._batch_sample_size = batch_sample_size
         # Générateur indépendant : le diagnostic ne consomme pas l'état RNG
@@ -44,8 +46,23 @@ class SigmaEpochStatistics:
         self._near_floor_count = 0
         self._minimum = float("inf")
         self._maximum = float("-inf")
+        self._by_feature = [
+            SigmaEpochStatistics(
+                near_floor_threshold,
+                reservoir_size=reservoir_size,
+                batch_sample_size=batch_sample_size,
+            )
+            for _ in self._feature_names
+        ]
 
     def update(self, sigma: Tensor) -> None:
+        if self._by_feature:
+            if sigma.shape[-1] != len(self._by_feature):
+                raise ValueError(
+                    "La dernière dimension de sigma ne correspond pas aux features"
+                )
+            for index, statistics in enumerate(self._by_feature):
+                statistics.update(sigma[..., index])
         values = sigma.detach().reshape(-1)
         count = values.numel()
         if count == 0:
@@ -104,6 +121,11 @@ class SigmaEpochStatistics:
             f"sigma_{name}": value.item()
             for name, value in zip(self._QUANTILES, quantile_values)
         })
+        if self._by_feature:
+            statistics["sigma_by_feature"] = {
+                name: feature_statistics.compute()
+                for name, feature_statistics in zip(self._feature_names, self._by_feature)
+            }
         return statistics
 
 
@@ -171,6 +193,9 @@ class Trainer:
         self._anomaly_filter_k = anomaly_filter_k
         self._anomaly_filter_min_history = anomaly_filter_min_history
         self._loss_history = deque(maxlen=anomaly_filter_history_size)
+        self._feature_names = tuple(
+            feature_names or (f"feature_{index}" for index in range(model.x_dims))
+        )
         self.scaler = MinMaxScaler()
 
         self._device = torch.device(
@@ -223,6 +248,17 @@ class Trainer:
                     f"Le gradient de {name} contient des NaN ou infinis"
                 )
 
+    @staticmethod
+    def _global_gradient_norm(parameters) -> float:
+        gradients = [
+            parameter.grad.detach().norm(2)
+            for parameter in parameters
+            if parameter.grad is not None
+        ]
+        if not gradients:
+            return 0.0
+        return torch.stack(gradients).norm(2).item()
+
     def _training_step(self, batch_x: Tensor, epoch: int) -> dict[str, float]:
         self._model.train()
         batch_x = batch_x.to(device=self._device, dtype=torch.float32)
@@ -260,6 +296,19 @@ class Trainer:
             "total_windows": len(batch_x),
             "batch_rejected": batch_rejected,
             "sigma": components["sigma"],
+            "diagnostics_by_feature": {
+                name: {
+                    "nll": components["nll_by_feature"][:, index].mean().item(),
+                    "nll_log_sigma": components["nll_log_sigma_by_feature"][:, index].mean().item(),
+                    "standardized_squared_error": components["standardized_squared_error_by_feature"][:, index].mean().item(),
+                    "mse": components["mse_by_feature"][:, index].mean().item(),
+                }
+                for index, name in enumerate(self._feature_names)
+            },
+            "nll_log_sigma": components["nll_log_sigma"].mean().item(),
+            "standardized_squared_error": components["standardized_squared_error"].mean().item(),
+            "gradient_norm_before_clip": float("nan"),
+            "gradient_norm_after_clip": float("nan"),
         }
         if batch_rejected:
             return metrics
@@ -268,12 +317,18 @@ class Trainer:
         self._check_loss(batch_loss)
         batch_loss.backward()
         self._check_gradients()
+        metrics["gradient_norm_before_clip"] = self._global_gradient_norm(
+            self._model.parameters()
+        )
 
         if self._grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 self._model.parameters(),
                 max_norm=self._grad_clip_norm,
             )
+        metrics["gradient_norm_after_clip"] = self._global_gradient_norm(
+            self._model.parameters()
+        )
 
         self._optimizer.step()
         self._global_step += 1
@@ -287,9 +342,14 @@ class Trainer:
         valid_values: Tensor,
     ) -> dict[str, float]:
         self._model.eval()
-        totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
+        totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0,
+                  "nll_log_sigma": 0.0, "standardized_squared_error": 0.0}
+        feature_totals = {name: {metric: 0.0 for metric in (
+            "nll", "nll_log_sigma", "standardized_squared_error", "mse")}
+            for name in self._feature_names}
         sigma_statistics = SigmaEpochStatistics(
             near_floor_threshold=2.0 * self._model.config.std_epsilon,
+            feature_names=self._feature_names,
         )
         observations = 0
 
@@ -305,6 +365,12 @@ class Trainer:
             observations += batch_size
             for name in totals:
                 totals[name] += components[name].mean().item() * batch_size
+            for index, feature_name in enumerate(self._feature_names):
+                for metric in feature_totals[feature_name]:
+                    feature_totals[feature_name][metric] += (
+                        components[f"{metric}_by_feature"][:, index].mean().item()
+                        * batch_size
+                    )
 
         if observations == 0:
             raise ValueError("Aucun batch de validation n'a été produit")
@@ -312,6 +378,10 @@ class Trainer:
             name: value / observations for name, value in totals.items()
         }
         metrics.update(sigma_statistics.compute())
+        metrics["diagnostics_by_feature"] = {
+            name: {metric: value / observations for metric, value in values.items()}
+            for name, values in feature_totals.items()
+        }
         return metrics
 
     def fit(
@@ -405,9 +475,16 @@ class Trainer:
                 break
             self._epoch = epoch
 
-            sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
+            sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0,
+                    "nll_log_sigma": 0.0, "standardized_squared_error": 0.0,
+                    "gradient_norm_before_clip": 0.0,
+                    "gradient_norm_after_clip": 0.0}
+            feature_sums = {name: {metric: 0.0 for metric in (
+                "nll", "nll_log_sigma", "standardized_squared_error", "mse")}
+                for name in self._feature_names}
             train_sigma_statistics = SigmaEpochStatistics(
                 near_floor_threshold=2.0 * self._model.config.std_epsilon,
+                feature_names=self._feature_names,
             )
             observations = 0
             rejected_windows = 0
@@ -426,6 +503,9 @@ class Trainer:
                     observations += batch_size
                     for name in sums:
                         sums[name] += step[name] * batch_size
+                    for feature_name, values in step["diagnostics_by_feature"].items():
+                        for metric, value in values.items():
+                            feature_sums[feature_name][metric] += value * batch_size
                 else:
                     rejected_batches += 1
                 rejected_windows += step["rejected_windows"]
@@ -447,6 +527,10 @@ class Trainer:
                         f"train_nll={running_metrics['nll']:.6f} | "
                         f"train_kl={running_metrics['kl']:.6f} | "
                         f"train_mse={running_metrics['mse']:.6f} | "
+                        f"train_nll_log_sigma={running_metrics['nll_log_sigma']:.6f} | "
+                        f"train_standardized_sq_error={running_metrics['standardized_squared_error']:.6f} | "
+                        f"grad_norm_before={running_metrics['gradient_norm_before_clip']:.6e} | "
+                        f"grad_norm_after={running_metrics['gradient_norm_after_clip']:.6e} | "
                         f"rejected_windows="
                         f"{rejected_windows / total_windows:.2%} | "
                         f"rejected_batches={rejected_batches}/{batch_index} | "
@@ -492,6 +576,10 @@ class Trainer:
                 name: value / observations for name, value in sums.items()
             }
             train_metrics.update(train_sigma_statistics.compute())
+            train_metrics["diagnostics_by_feature"] = {
+                name: {metric: value / observations for metric, value in values.items()}
+                for name, values in feature_sums.items()
+            }
             rejection_rate = rejected_windows / total_windows
             learning_rate = self._optimizer.param_groups[0]["lr"]
 
@@ -505,6 +593,12 @@ class Trainer:
                 f"valid_nll={valid_metrics['nll']:.6f} | "
                 f"valid_kl={valid_metrics['kl']:.6f} | "
                 f"valid_mse={valid_metrics['mse']:.6f} | "
+                f"train_nll_log_sigma={train_metrics['nll_log_sigma']:.6f} | "
+                f"train_standardized_sq_error={train_metrics['standardized_squared_error']:.6f} | "
+                f"valid_nll_log_sigma={valid_metrics['nll_log_sigma']:.6f} | "
+                f"valid_standardized_sq_error={valid_metrics['standardized_squared_error']:.6f} | "
+                f"grad_norm_before={train_metrics['gradient_norm_before_clip']:.6e} | "
+                f"grad_norm_after={train_metrics['gradient_norm_after_clip']:.6e} | "
                 f"train_sigma_min={train_metrics['sigma_min']:.6e} | "
                 f"train_sigma_p01={train_metrics['sigma_p01']:.6e} | "
                 f"train_sigma_p10={train_metrics['sigma_p10']:.6e} | "
@@ -529,6 +623,10 @@ class Trainer:
                 f"rejected_windows={rejection_rate:.2%}"
                 f" | rejected_batches={rejected_batches}/{epoch_batch_count}"
             )
+            print("Train diagnostics by feature:", train_metrics["diagnostics_by_feature"])
+            print("Train sigma by feature:", train_metrics["sigma_by_feature"])
+            print("Validation diagnostics by feature:", valid_metrics["diagnostics_by_feature"])
+            print("Validation sigma by feature:", valid_metrics["sigma_by_feature"])
 
             if valid_metrics["loss"] < best_valid_loss:
                 best_valid_loss = valid_metrics["loss"]
