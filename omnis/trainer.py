@@ -142,6 +142,7 @@ class Trainer:
         batch_size: int = 256,
         valid_batch_size: int = 1024,
         train_log_step_freq: int = 100,
+        deep_training_diagnostics: bool = False,
         initial_lr: float = 1e-3,
         lr_anneal_epochs: int = 10,
         lr_anneal_factor: float = 0.75,
@@ -183,6 +184,7 @@ class Trainer:
         self._batch_size = batch_size
         self._valid_batch_size = valid_batch_size
         self._train_log_step_freq = train_log_step_freq
+        self._deep_training_diagnostics = deep_training_diagnostics
         self._grad_clip_norm = grad_clip_norm
         self._check_numerics = check_numerics
         self._early_stopping_validation_patience = (
@@ -259,6 +261,19 @@ class Trainer:
             return 0.0
         return torch.stack(gradients).norm(2).item()
 
+    @staticmethod
+    def _format_sigma_statistics(prefix: str, metrics: dict) -> str:
+        names = ("min", "p01", "p10", "median", "mean", "p90", "p99", "max")
+        values = "".join(
+            f"{prefix}_sigma_{name}={metrics[f'sigma_{name}']:.6e} | "
+            for name in names
+        )
+        return (
+            values
+            + f"{prefix}_sigma_fraction_near_floor="
+            + f"{metrics['sigma_fraction_near_floor']:.2%} | "
+        )
+
     def _training_step(self, batch_x: Tensor, epoch: int) -> dict[str, float]:
         self._model.train()
         batch_x = batch_x.to(device=self._device, dtype=torch.float32)
@@ -267,6 +282,7 @@ class Trainer:
         components = self._model.get_per_window_loss(
             x=batch_x,
             n_z=self._train_n_z,
+            deep_diagnostics=self._deep_training_diagnostics,
         )
         per_window_losses = components["loss"]
         self._check_loss(per_window_losses)
@@ -295,8 +311,11 @@ class Trainer:
             "rejected_windows": len(batch_x) if batch_rejected else 0,
             "total_windows": len(batch_x),
             "batch_rejected": batch_rejected,
-            "sigma": components["sigma"],
-            "diagnostics_by_feature": {
+        }
+        if self._deep_training_diagnostics:
+            metrics.update({
+                "sigma": components["sigma"],
+                "diagnostics_by_feature": {
                 name: {
                     "nll": components["nll_by_feature"][:, index].mean().item(),
                     "nll_log_sigma": components["nll_log_sigma_by_feature"][:, index].mean().item(),
@@ -304,12 +323,14 @@ class Trainer:
                     "mse": components["mse_by_feature"][:, index].mean().item(),
                 }
                 for index, name in enumerate(self._feature_names)
-            },
-            "nll_log_sigma": components["nll_log_sigma"].mean().item(),
-            "standardized_squared_error": components["standardized_squared_error"].mean().item(),
-            "gradient_norm_before_clip": float("nan"),
-            "gradient_norm_after_clip": float("nan"),
-        }
+                },
+                "nll_log_sigma": components["nll_log_sigma"].mean().item(),
+                "standardized_squared_error": (
+                    components["standardized_squared_error"].mean().item()
+                ),
+                "gradient_norm_before_clip": float("nan"),
+                "gradient_norm_after_clip": float("nan"),
+            })
         if batch_rejected:
             return metrics
 
@@ -317,18 +338,20 @@ class Trainer:
         self._check_loss(batch_loss)
         batch_loss.backward()
         self._check_gradients()
-        metrics["gradient_norm_before_clip"] = self._global_gradient_norm(
-            self._model.parameters()
-        )
+        if self._deep_training_diagnostics:
+            metrics["gradient_norm_before_clip"] = self._global_gradient_norm(
+                self._model.parameters()
+            )
 
         if self._grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 self._model.parameters(),
                 max_norm=self._grad_clip_norm,
             )
-        metrics["gradient_norm_after_clip"] = self._global_gradient_norm(
-            self._model.parameters()
-        )
+        if self._deep_training_diagnostics:
+            metrics["gradient_norm_after_clip"] = self._global_gradient_norm(
+                self._model.parameters()
+            )
 
         self._optimizer.step()
         self._global_step += 1
@@ -342,15 +365,18 @@ class Trainer:
         valid_values: Tensor,
     ) -> dict[str, float]:
         self._model.eval()
-        totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0,
-                  "nll_log_sigma": 0.0, "standardized_squared_error": 0.0}
-        feature_totals = {name: {metric: 0.0 for metric in (
-            "nll", "nll_log_sigma", "standardized_squared_error", "mse")}
-            for name in self._feature_names}
-        sigma_statistics = SigmaEpochStatistics(
-            near_floor_threshold=2.0 * self._model.config.std_epsilon,
-            feature_names=self._feature_names,
-        )
+        totals = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
+        feature_totals = None
+        sigma_statistics = None
+        if self._deep_training_diagnostics:
+            totals.update({"nll_log_sigma": 0.0, "standardized_squared_error": 0.0})
+            feature_totals = {name: {metric: 0.0 for metric in (
+                "nll", "nll_log_sigma", "standardized_squared_error", "mse")}
+                for name in self._feature_names}
+            sigma_statistics = SigmaEpochStatistics(
+                near_floor_threshold=2.0 * self._model.config.std_epsilon,
+                feature_names=self._feature_names,
+            )
         observations = 0
 
         for (batch_x,) in valid_iterator.get_iterator([valid_values]):
@@ -358,30 +384,34 @@ class Trainer:
             components = self._model.get_per_window_loss(
                 x=batch_x,
                 n_z=self._valid_n_z,
+                deep_diagnostics=self._deep_training_diagnostics,
             )
             self._check_loss(components["loss"])
-            sigma_statistics.update(components["sigma"])
+            if sigma_statistics is not None:
+                sigma_statistics.update(components["sigma"])
             batch_size = len(batch_x)
             observations += batch_size
             for name in totals:
                 totals[name] += components[name].mean().item() * batch_size
-            for index, feature_name in enumerate(self._feature_names):
-                for metric in feature_totals[feature_name]:
-                    feature_totals[feature_name][metric] += (
-                        components[f"{metric}_by_feature"][:, index].mean().item()
-                        * batch_size
-                    )
+            if feature_totals is not None:
+                for index, feature_name in enumerate(self._feature_names):
+                    for metric in feature_totals[feature_name]:
+                        feature_totals[feature_name][metric] += (
+                            components[f"{metric}_by_feature"][:, index].mean().item()
+                            * batch_size
+                        )
 
         if observations == 0:
             raise ValueError("Aucun batch de validation n'a été produit")
         metrics = {
             name: value / observations for name, value in totals.items()
         }
-        metrics.update(sigma_statistics.compute())
-        metrics["diagnostics_by_feature"] = {
-            name: {metric: value / observations for metric, value in values.items()}
-            for name, values in feature_totals.items()
-        }
+        if sigma_statistics is not None and feature_totals is not None:
+            metrics.update(sigma_statistics.compute())
+            metrics["diagnostics_by_feature"] = {
+                name: {metric: value / observations for metric, value in values.items()}
+                for name, values in feature_totals.items()
+            }
         return metrics
 
     def fit(
@@ -475,17 +505,23 @@ class Trainer:
                 break
             self._epoch = epoch
 
-            sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0,
-                    "nll_log_sigma": 0.0, "standardized_squared_error": 0.0,
+            sums = {"loss": 0.0, "nll": 0.0, "kl": 0.0, "mse": 0.0}
+            feature_sums = None
+            train_sigma_statistics = None
+            if self._deep_training_diagnostics:
+                sums.update({
+                    "nll_log_sigma": 0.0,
+                    "standardized_squared_error": 0.0,
                     "gradient_norm_before_clip": 0.0,
-                    "gradient_norm_after_clip": 0.0}
-            feature_sums = {name: {metric: 0.0 for metric in (
-                "nll", "nll_log_sigma", "standardized_squared_error", "mse")}
-                for name in self._feature_names}
-            train_sigma_statistics = SigmaEpochStatistics(
-                near_floor_threshold=2.0 * self._model.config.std_epsilon,
-                feature_names=self._feature_names,
-            )
+                    "gradient_norm_after_clip": 0.0,
+                })
+                feature_sums = {name: {metric: 0.0 for metric in (
+                    "nll", "nll_log_sigma", "standardized_squared_error", "mse")}
+                    for name in self._feature_names}
+                train_sigma_statistics = SigmaEpochStatistics(
+                    near_floor_threshold=2.0 * self._model.config.std_epsilon,
+                    feature_names=self._feature_names,
+                )
             observations = 0
             rejected_windows = 0
             total_windows = 0
@@ -499,13 +535,15 @@ class Trainer:
                 train_batch_times.append(perf_counter() - batch_start)
                 batch_size = len(batch_x)
                 if not step["batch_rejected"]:
-                    train_sigma_statistics.update(step["sigma"])
+                    if train_sigma_statistics is not None:
+                        train_sigma_statistics.update(step["sigma"])
                     observations += batch_size
                     for name in sums:
                         sums[name] += step[name] * batch_size
-                    for feature_name, values in step["diagnostics_by_feature"].items():
-                        for metric, value in values.items():
-                            feature_sums[feature_name][metric] += value * batch_size
+                    if feature_sums is not None:
+                        for feature_name, values in step["diagnostics_by_feature"].items():
+                            for metric, value in values.items():
+                                feature_sums[feature_name][metric] += value * batch_size
                 else:
                     rejected_batches += 1
                 rejected_windows += step["rejected_windows"]
@@ -519,6 +557,17 @@ class Trainer:
                         name: value / observations if observations else float("nan")
                         for name, value in sums.items()
                     }
+                    diagnostic_log = ""
+                    if self._deep_training_diagnostics:
+                        diagnostic_log = (
+                            f"train_nll_log_sigma={running_metrics['nll_log_sigma']:.6f} | "
+                            f"train_standardized_sq_error="
+                            f"{running_metrics['standardized_squared_error']:.6f} | "
+                            f"grad_norm_before="
+                            f"{running_metrics['gradient_norm_before_clip']:.6e} | "
+                            f"grad_norm_after="
+                            f"{running_metrics['gradient_norm_after_clip']:.6e} | "
+                        )
                     print(
                         f"Epoch {epoch:03d} | "
                         f"batch={batch_index}/{epoch_batch_count} | "
@@ -527,10 +576,7 @@ class Trainer:
                         f"train_nll={running_metrics['nll']:.6f} | "
                         f"train_kl={running_metrics['kl']:.6f} | "
                         f"train_mse={running_metrics['mse']:.6f} | "
-                        f"train_nll_log_sigma={running_metrics['nll_log_sigma']:.6f} | "
-                        f"train_standardized_sq_error={running_metrics['standardized_squared_error']:.6f} | "
-                        f"grad_norm_before={running_metrics['gradient_norm_before_clip']:.6e} | "
-                        f"grad_norm_after={running_metrics['gradient_norm_after_clip']:.6e} | "
+                        f"{diagnostic_log}"
                         f"rejected_windows="
                         f"{rejected_windows / total_windows:.2%} | "
                         f"rejected_batches={rejected_batches}/{batch_index} | "
@@ -575,14 +621,34 @@ class Trainer:
             train_metrics = {
                 name: value / observations for name, value in sums.items()
             }
-            train_metrics.update(train_sigma_statistics.compute())
-            train_metrics["diagnostics_by_feature"] = {
-                name: {metric: value / observations for metric, value in values.items()}
-                for name, values in feature_sums.items()
-            }
+            if train_sigma_statistics is not None and feature_sums is not None:
+                train_metrics.update(train_sigma_statistics.compute())
+                train_metrics["diagnostics_by_feature"] = {
+                    name: {
+                        metric: value / observations
+                        for metric, value in values.items()
+                    }
+                    for name, values in feature_sums.items()
+                }
             rejection_rate = rejected_windows / total_windows
             learning_rate = self._optimizer.param_groups[0]["lr"]
 
+            diagnostic_log = ""
+            if self._deep_training_diagnostics:
+                diagnostic_log = (
+                    f"train_nll_log_sigma={train_metrics['nll_log_sigma']:.6f} | "
+                    f"train_standardized_sq_error="
+                    f"{train_metrics['standardized_squared_error']:.6f} | "
+                    f"valid_nll_log_sigma={valid_metrics['nll_log_sigma']:.6f} | "
+                    f"valid_standardized_sq_error="
+                    f"{valid_metrics['standardized_squared_error']:.6f} | "
+                    f"grad_norm_before="
+                    f"{train_metrics['gradient_norm_before_clip']:.6e} | "
+                    f"grad_norm_after="
+                    f"{train_metrics['gradient_norm_after_clip']:.6e} | "
+                    f"{self._format_sigma_statistics('train', train_metrics)}"
+                    f"{self._format_sigma_statistics('valid', valid_metrics)}"
+                )
             print(
                 f"Epoch {epoch:03d} | "
                 f"train_loss={train_metrics['loss']:.6f} | "
@@ -593,40 +659,16 @@ class Trainer:
                 f"valid_nll={valid_metrics['nll']:.6f} | "
                 f"valid_kl={valid_metrics['kl']:.6f} | "
                 f"valid_mse={valid_metrics['mse']:.6f} | "
-                f"train_nll_log_sigma={train_metrics['nll_log_sigma']:.6f} | "
-                f"train_standardized_sq_error={train_metrics['standardized_squared_error']:.6f} | "
-                f"valid_nll_log_sigma={valid_metrics['nll_log_sigma']:.6f} | "
-                f"valid_standardized_sq_error={valid_metrics['standardized_squared_error']:.6f} | "
-                f"grad_norm_before={train_metrics['gradient_norm_before_clip']:.6e} | "
-                f"grad_norm_after={train_metrics['gradient_norm_after_clip']:.6e} | "
-                f"train_sigma_min={train_metrics['sigma_min']:.6e} | "
-                f"train_sigma_p01={train_metrics['sigma_p01']:.6e} | "
-                f"train_sigma_p10={train_metrics['sigma_p10']:.6e} | "
-                f"train_sigma_median={train_metrics['sigma_median']:.6e} | "
-                f"train_sigma_mean={train_metrics['sigma_mean']:.6e} | "
-                f"train_sigma_p90={train_metrics['sigma_p90']:.6e} | "
-                f"train_sigma_p99={train_metrics['sigma_p99']:.6e} | "
-                f"train_sigma_max={train_metrics['sigma_max']:.6e} | "
-                f"train_sigma_fraction_near_floor="
-                f"{train_metrics['sigma_fraction_near_floor']:.2%} | "
-                f"valid_sigma_min={valid_metrics['sigma_min']:.6e} | "
-                f"valid_sigma_p01={valid_metrics['sigma_p01']:.6e} | "
-                f"valid_sigma_p10={valid_metrics['sigma_p10']:.6e} | "
-                f"valid_sigma_median={valid_metrics['sigma_median']:.6e} | "
-                f"valid_sigma_mean={valid_metrics['sigma_mean']:.6e} | "
-                f"valid_sigma_p90={valid_metrics['sigma_p90']:.6e} | "
-                f"valid_sigma_p99={valid_metrics['sigma_p99']:.6e} | "
-                f"valid_sigma_max={valid_metrics['sigma_max']:.6e} | "
-                f"valid_sigma_fraction_near_floor="
-                f"{valid_metrics['sigma_fraction_near_floor']:.2%} | "
+                f"{diagnostic_log}"
                 f"learning_rate={learning_rate:.8f} | "
                 f"rejected_windows={rejection_rate:.2%}"
                 f" | rejected_batches={rejected_batches}/{epoch_batch_count}"
             )
-            print("Train diagnostics by feature:", train_metrics["diagnostics_by_feature"])
-            print("Train sigma by feature:", train_metrics["sigma_by_feature"])
-            print("Validation diagnostics by feature:", valid_metrics["diagnostics_by_feature"])
-            print("Validation sigma by feature:", valid_metrics["sigma_by_feature"])
+            if self._deep_training_diagnostics:
+                print("Train diagnostics by feature:", train_metrics["diagnostics_by_feature"])
+                print("Train sigma by feature:", train_metrics["sigma_by_feature"])
+                print("Validation diagnostics by feature:", valid_metrics["diagnostics_by_feature"])
+                print("Validation sigma by feature:", valid_metrics["sigma_by_feature"])
 
             if valid_metrics["loss"] < best_valid_loss:
                 best_valid_loss = valid_metrics["loss"]

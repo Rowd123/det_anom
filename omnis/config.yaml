@@ -37,6 +37,7 @@ valid_batch_size: 50
 train_log_step_freq: 100
 train_n_z: 1
 valid_n_z: 8
+deep_training_diagnostics: false
 
 # Filtrage robuste des fenêtres probablement anormales
 anomaly_filter_enabled: false

@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+from copy import deepcopy
 
 import pytest
 import torch
@@ -9,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "omnis"))
 
 from model import OmniAnomaly
 from units import DistributionParameterNetwork
-from trainer import SigmaEpochStatistics
+from trainer import SigmaEpochStatistics, Trainer
 
 
 class IdentityHidden(torch.nn.Module):
@@ -53,7 +54,7 @@ def test_loss_diagnostics_are_finite_detached_and_preserve_decoder_gradients(mod
     torch.manual_seed(3)
     model = OmniAnomaly(_config(mode))
     x = torch.randn(3, 4, 2)
-    metrics = model.get_per_window_loss(x, n_z=2)
+    metrics = model.get_per_window_loss(x, n_z=2, deep_diagnostics=True)
 
     for name, value in metrics.items():
         assert torch.isfinite(value).all(), name
@@ -74,7 +75,9 @@ def test_loss_diagnostics_are_finite_detached_and_preserve_decoder_gradients(mod
 def test_training_diagnostics_accept_reduced_feature_dimension():
     names = tuple(f"feature_{index}" for index in range(16))
     model = OmniAnomaly(_config(x_dim=len(names)))
-    components = model.get_per_window_loss(torch.randn(3, 4, len(names)), n_z=2)
+    components = model.get_per_window_loss(
+        torch.randn(3, 4, len(names)), n_z=2, deep_diagnostics=True
+    )
     assert components["nll_by_feature"].shape == (3, len(names))
     assert torch.isfinite(components["loss"]).all()
     components["loss"].mean().backward()
@@ -87,3 +90,56 @@ def test_training_diagnostics_accept_reduced_feature_dimension():
         feature_metrics["sigma_mean"] == pytest.approx(0.05)
         for feature_metrics in metrics["sigma_by_feature"].values()
     )
+
+
+def test_deep_diagnostics_are_disabled_by_default_and_skip_expensive_metrics():
+    model = OmniAnomaly(_config())
+    components = model.get_per_window_loss(torch.randn(3, 4, 2), n_z=2)
+    assert set(components) == {"loss", "nll", "kl", "mse"}
+
+    trainer = Trainer(model, max_epoch=1, batch_size=2, valid_batch_size=2)
+    assert trainer._deep_training_diagnostics is False
+
+
+def test_diagnostics_do_not_change_loss_gradients_rng_or_clipping():
+    torch.manual_seed(17)
+    normal_model = OmniAnomaly(_config())
+    diagnostic_model = deepcopy(normal_model)
+    normal_trainer = Trainer(
+        normal_model, max_epoch=1, batch_size=2, valid_batch_size=2,
+        deep_training_diagnostics=False, grad_clip_norm=0.05,
+    )
+    diagnostic_trainer = Trainer(
+        diagnostic_model, max_epoch=1, batch_size=2, valid_batch_size=2,
+        deep_training_diagnostics=True, grad_clip_norm=0.05,
+    )
+    batch = torch.randn(2, 4, 2)
+    rng_before = torch.random.get_rng_state()
+
+    normal_step = normal_trainer._training_step(batch, epoch=1)
+    normal_rng_after = torch.random.get_rng_state()
+    torch.random.set_rng_state(rng_before)
+    diagnostic_step = diagnostic_trainer._training_step(batch, epoch=1)
+    diagnostic_rng_after = torch.random.get_rng_state()
+
+    assert normal_step.keys() >= {"loss", "nll", "kl", "mse"}
+    assert "diagnostics_by_feature" not in normal_step
+    assert "diagnostics_by_feature" in diagnostic_step
+    assert normal_step["loss"] == pytest.approx(diagnostic_step["loss"])
+    assert torch.equal(normal_rng_after, diagnostic_rng_after)
+    for normal_parameter, diagnostic_parameter in zip(
+        normal_model.parameters(), diagnostic_model.parameters()
+    ):
+        assert (normal_parameter.grad is None) == (diagnostic_parameter.grad is None)
+        if normal_parameter.grad is not None:
+            torch.testing.assert_close(
+                normal_parameter.grad, diagnostic_parameter.grad
+            )
+        torch.testing.assert_close(normal_parameter, diagnostic_parameter)
+    normal_gradient_norm = torch.stack([
+        parameter.grad.norm(2)
+        for parameter in normal_model.parameters()
+        if parameter.grad is not None
+    ]).norm(2)
+    assert normal_gradient_norm <= 0.050001
+    assert diagnostic_step["gradient_norm_after_clip"] <= 0.050001

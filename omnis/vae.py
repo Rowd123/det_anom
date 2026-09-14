@@ -393,7 +393,12 @@ class VAE(nn.Module):
             x,
         )
 
-    def get_per_window_loss(self, x: Tensor, n_z: int = 1) -> dict[str, Tensor]:
+    def get_per_window_loss(
+        self,
+        x: Tensor,
+        n_z: int = 1,
+        deep_diagnostics: bool = False,
+    ) -> dict[str, Tensor]:
         """Calcule la même ELBO Monte-Carlo, sans réduire le batch Pyro."""
         if n_z < 1:
             raise ValueError("n_z doit être supérieur ou égal à 1")
@@ -402,6 +407,19 @@ class VAE(nn.Module):
         z = posterior.rsample(torch.Size([n_z]))
         prior = self.prior(x)
         likelihood = self.likelihood(z)
+
+        log_px = likelihood.log_prob(x)
+        log_pz = prior.log_prob(z)
+        log_qz = posterior.log_prob(z)
+        nll = -log_px.mean(dim=0)
+        kl = (log_qz - log_pz).mean(dim=0)
+        per_window_loss = nll + kl
+        reconstruction_mean = likelihood.mean.mean(dim=0)
+        mse = (reconstruction_mean - x).square().mean(dim=(-2, -1))
+        components = {"loss": per_window_loss, "nll": nll, "kl": kl, "mse": mse}
+
+        if not deep_diagnostics:
+            return components
 
         # _to_event encapsule la Normal dans une Independent. Son base_dist
         # reste la Normal construite par le décodeur et porte son scale.
@@ -431,20 +449,7 @@ class VAE(nn.Module):
             )
             mse_by_feature = (loc - x).square().mean(dim=0).mean(dim=1)
 
-        log_px = likelihood.log_prob(x)
-        log_pz = prior.log_prob(z)
-        log_qz = posterior.log_prob(z)
-        nll = -log_px.mean(dim=0)
-        kl = (log_qz - log_pz).mean(dim=0)
-        per_window_loss = nll + kl
-        reconstruction_mean = likelihood.mean.mean(dim=0)
-        mse = (reconstruction_mean - x).square().mean(dim=(-2, -1))
-
-        return {
-            "loss": per_window_loss,
-            "nll": nll,
-            "kl": kl,
-            "mse": mse,
+        components.update({
             # Vue détachée du scale de likelihood : le Trainer peut ainsi
             # instrumenter sigma sans conserver ni modifier le graphe de loss.
             "sigma": sigma,
@@ -458,7 +463,8 @@ class VAE(nn.Module):
                 standardized_squared_error_by_feature.detach()
             ),
             "mse_by_feature": mse_by_feature.detach(),
-        }
+        })
+        return components
 
     def make_svi(
         self,
