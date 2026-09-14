@@ -7,11 +7,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).parents[1] / "omnis"))
 
 from utils import (  # noqa: E402
+    FEATURE_REPRESENTATION_VERSION,
     MinMaxScaler,
     build_feature_representation,
     inverse_transform_physical,
     phase_embedding_to_phasor,
     phasor_to_phase_embedding,
+    resolve_data_column_order,
     validate_checkpoint_model_dimension,
 )
 
@@ -28,6 +30,14 @@ def sequence_columns():
         name
         for quantity in ("VA_V0", "VA_V1", "VA_V2", "IA_I0", "IA_I1", "IA_I2")
         for name in (f"VIGY_1:{quantity}_MAG", f"VIGY_1:{quantity}_ANG")
+    ]
+
+
+def corrected_columns():
+    return ["ROCOF", "FREQ"] + [
+        name
+        for phasor in ("I0", "I1", "I2", "V0", "V1", "V2")
+        for name in (f"{phasor}.ANG", f"{phasor}.MAG")
     ]
 
 
@@ -163,4 +173,70 @@ def test_checkpoint_with_full_representation_is_rejected_for_reduced_model():
     with np.testing.assert_raises(ValueError):
         validate_checkpoint_model_dimension(
             checkpoint, reduced.model_dim, reduced.model_names
+        )
+
+
+def test_correct_ang_mag_semantics_and_scaling_round_trip():
+    mapping = build_feature_representation(
+        corrected_columns(), exclude_zero_sequence_phase=True
+    )
+    physical = np.array([[
+        0.02, 50.0,
+        170.0, 2.0,
+        30.0, 1000.0,
+        -20.0, 900.0,
+        -175.0, 20.0,
+        -45.0, 240000.0,
+        60.0, 230000.0,
+    ]])
+    embedded = phasor_to_phase_embedding(physical, mapping)
+
+    names = {name: index for index, name in enumerate(mapping.model_names)}
+    assert embedded[0, names["i1_mag"]] == 1000.0
+    np.testing.assert_allclose(embedded[0, names["i1_phase_cos"]], np.cos(np.deg2rad(30)))
+    np.testing.assert_allclose(embedded[0, names["i1_phase_sin"]], np.sin(np.deg2rad(30)))
+    assert embedded[0, names["v1_mag"]] == 240000.0
+    np.testing.assert_allclose(embedded[0, names["v1_phase_cos"]], np.cos(np.deg2rad(-45)))
+    np.testing.assert_allclose(embedded[0, names["v1_phase_sin"]], np.sin(np.deg2rad(-45)))
+    assert "i0_mag" in names and "v0_mag" in names
+    assert "i0_phase_cos" not in names and "v0_phase_sin" not in names
+
+    second = physical.copy()
+    second[0, [5, 11]] = [1100.0, 250000.0]
+    second[0, [4, 10]] = [35.0, -40.0]
+    scaler = MinMaxScaler().fit(np.concatenate((physical, second)))
+    scaled = scaler.transform(embedded)
+    unscaled = scaler.inverse_transform(scaled)
+    restored = phase_embedding_to_phasor(unscaled, mapping).numpy()
+    reconstructible = [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    np.testing.assert_allclose(restored[0, reconstructible], physical[0, reconstructible])
+    assert scaler.minimum[0, names["i1_mag"]] == 1000.0
+    assert scaler.minimum[0, names["v1_mag"]] == 240000.0
+    assert abs(scaler.minimum[0, names["i1_phase_cos"]]) <= 1.0
+    assert abs(scaler.minimum[0, names["v1_phase_sin"]]) <= 1.0
+
+
+def test_configured_column_order_reorders_real_columns_and_rejects_missing():
+    configured = corrected_columns()
+    actual = [f"VIGY_1:{name}" for name in reversed(configured)]
+    assert resolve_data_column_order(actual, configured) == list(reversed(actual))
+    with np.testing.assert_raises_regex(ValueError, "manquante"):
+        resolve_data_column_order(actual[:-1], configured)
+
+
+def test_semantically_old_checkpoint_is_rejected_even_with_same_dimension():
+    mapping = build_feature_representation(
+        corrected_columns(), exclude_zero_sequence_phase=True
+    )
+    checkpoint = {
+        "model_x_dim": mapping.model_dim,
+        "model_feature_names": mapping.model_names,
+        "feature_representation": "optional_zero_sequence_phase_v2",
+    }
+    with np.testing.assert_raises_regex(ValueError, "sémantique ANG/MAG"):
+        validate_checkpoint_model_dimension(
+            checkpoint,
+            mapping.model_dim,
+            mapping.model_names,
+            FEATURE_REPRESENTATION_VERSION,
         )

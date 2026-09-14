@@ -16,6 +16,7 @@ import yaml
 
 from model import OmniAnomaly
 from utils import (
+    FEATURE_REPRESENTATION_VERSION,
     MinMaxScaler,
     get_data,
     inverse_transform_physical,
@@ -214,6 +215,7 @@ def main(arguments):
         print_log=False,
         return_metadata=True,
         exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
+        data_column_order=config.data_column_order,
     )
     values, _, excludes = train if split == "train" else test
     if values is None:
@@ -231,6 +233,7 @@ def main(arguments):
         state,
         config.x_dim,
         expected_feature_names=representation.model_names,
+        expected_representation_version=FEATURE_REPRESENTATION_VERSION,
     )
     model = OmniAnomaly(config).to(device)
     model.load_state_dict(state["model_state_dict"])

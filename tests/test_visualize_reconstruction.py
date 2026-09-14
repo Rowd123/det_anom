@@ -14,10 +14,10 @@ from visualize_reconstruction import (  # noqa: E402
 
 
 def _columns():
-    return ["FREQ", "DFDT"] + [
+    return ["ROCOF", "FREQ"] + [
         name
         for quantity in ("VA_V0", "VA_V1", "VA_V2", "IA_I0", "IA_I1", "IA_I2")
-        for name in (f"VIGY_1:{quantity}_MAG", f"VIGY_1:{quantity}_ANG")
+        for name in (f"VIGY_1:{quantity}_ANG", f"VIGY_1:{quantity}_MAG")
     ]
 
 
@@ -27,10 +27,10 @@ def test_visualization_uses_reduced_representation_without_fake_phase_plots():
     )
     indices = physical_reconstruction_indices(representation)
 
-    assert indices == [0, 1, 2, 4, 5, 6, 7, 8, 10, 11, 12, 13]
-    assert 3 not in indices  # phase V0
-    assert 9 not in indices  # phase I0
-    assert 2 in indices and 8 in indices  # amplitudes V0 et I0
+    assert indices == [0, 1, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13]
+    assert 2 not in indices  # phase V0
+    assert 8 not in indices  # phase I0
+    assert 3 in indices and 9 in indices  # amplitudes V0 et I0
 
 
 def test_cli_values_override_visualization_config():
@@ -48,7 +48,7 @@ def test_visualization_config_matches_training_representation_and_model():
         visualization = yaml.safe_load(file)
 
     matching_keys = (
-        "dataset", "data_dir", "exclude_zero_sequence_phase",
+        "dataset", "data_dir", "data_column_order", "exclude_zero_sequence_phase",
         "use_connected_z_q", "use_connected_z_p", "z_dim",
         "rnn_num_hidden", "window_length", "dense_dim", "std_epsilon",
         "decoder_sigma_mode", "decoder_fixed_sigma", "get_score_on_dim",

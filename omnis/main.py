@@ -123,19 +123,27 @@ def main(config) -> None:
         train_start=config.train_start,
         return_metadata=True,
         exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
+        data_column_order=config.data_column_order,
     )
     config.x_dim = feature_representation.model_dim
 
     print(f"Physical dimension: {feature_representation.physical_dim}")
     print(f"Model dimension: {feature_representation.model_dim}")
-    print("\nPhysical phasors:")
+    print("\nPhysical input order:")
+    for index, feature_name in enumerate(feature_representation.original_names):
+        print(f"{index}  {feature_name}")
+    print("\nPhasor mapping:")
     for phasor in feature_representation.phasors:
         sequence = (
             f"sequence {phasor.sequence}"
             if phasor.sequence is not None
             else "unclassified"
         )
-        print(f"- {phasor.amplitude_name} / {phasor.phase_name}: {sequence}")
+        phase_status = "phase included" if phasor.includes_phase else "phase excluded"
+        print(
+            f"- {sequence}: phase={phasor.phase_name}, "
+            f"magnitude={phasor.amplitude_name}, {phase_status}"
+        )
     print("\nModel features:")
     for feature_name in feature_representation.model_names:
         print(f"- {feature_name}")

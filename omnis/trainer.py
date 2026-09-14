@@ -11,7 +11,12 @@ import pyro
 import torch
 from torch import Tensor, nn
 
-from utils import BatchSlidingWindow, MinMaxScaler, validate_checkpoint_model_dimension
+from utils import (
+    FEATURE_REPRESENTATION_VERSION,
+    BatchSlidingWindow,
+    MinMaxScaler,
+    validate_checkpoint_model_dimension,
+)
 
 
 class SigmaEpochStatistics:
@@ -722,7 +727,7 @@ class Trainer:
                 "scaler_state_dict": self.scaler.state_dict(),
                 "loss_history": list(self._loss_history),
                 "model_x_dim": self._model.x_dims,
-                "feature_representation": "optional_zero_sequence_phase_v2",
+                "feature_representation": FEATURE_REPRESENTATION_VERSION,
                 "model_feature_names": self._feature_names,
             },
             path,
@@ -744,6 +749,7 @@ class Trainer:
             checkpoint,
             self._model.x_dims,
             expected_feature_names=self._feature_names,
+            expected_representation_version=FEATURE_REPRESENTATION_VERSION,
         )
 
         self._model.load_state_dict(checkpoint["model_state_dict"])

@@ -1,6 +1,21 @@
 # Données et représentation (doivent correspondre au checkpoint)
 dataset: PMU
 data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
+data_column_order:
+  - ROCOF
+  - FREQ
+  - I0.ANG
+  - I0.MAG
+  - I1.ANG
+  - I1.MAG
+  - I2.ANG
+  - I2.MAG
+  - V0.ANG
+  - V0.MAG
+  - V1.ANG
+  - V1.MAG
+  - V2.ANG
+  - V2.MAG
 x_dim: null  # dérivé de la représentation au chargement
 exclude_zero_sequence_phase: true
 

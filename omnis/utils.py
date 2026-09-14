@@ -65,7 +65,8 @@ class FeatureRepresentation:
         return len(self.model_names)
 
 
-PMU_FIRST_PHASOR_INDEX = 2
+FEATURE_REPRESENTATION_VERSION = "phasor_ang_mag_corrected_v3"
+_KIND_PATTERN = re.compile(r"(?i)(ANG|MAG)$")
 
 
 def _readable_feature_name(name: str) -> str:
@@ -84,6 +85,14 @@ def _phasor_name(amplitude_name: str, phase_name: str) -> str:
         common_length += 1
     common_name = amplitude_name[:common_length].rstrip(" _.-")
     return common_name or amplitude_name
+
+
+def _phasor_column(name: str) -> tuple[str, str] | None:
+    """Retourne (identifiant du phasor, ANG|MAG) depuis le nom explicite."""
+    match = _KIND_PATTERN.search(name)
+    if match is None:
+        return None
+    return name[:match.start()].rstrip("._ -"), match.group(1).upper()
 
 
 _SEQUENCE_PATTERN = re.compile(r"(?:^|[^A-Z0-9])(?:V|I)([012])(?:[^A-Z0-9]|$)", re.I)
@@ -107,18 +116,23 @@ def build_feature_representation(
     column_names,
     exclude_zero_sequence_phase: bool = False,
 ) -> FeatureRepresentation:
-    """Décrit tous les couples PMU (2, 3), (4, 5), ..., dans l'ordre du CSV."""
+    """Construit les couples PMU uniquement à partir des suffixes ANG et MAG."""
     original_names = tuple(str(name) for name in column_names)
-    phasor_feature_count = len(original_names) - PMU_FIRST_PHASOR_INDEX
-    if phasor_feature_count < 0 or phasor_feature_count % 2:
-        raise ValueError(
-            "Les variables PMU à partir de l'indice 2 doivent former des "
-            "couples amplitude/phase"
-        )
-
     model_names = []
     direct_features = []
-    for physical_index, name in enumerate(original_names[:PMU_FIRST_PHASOR_INDEX]):
+    phasor_columns = {}
+    phasor_order = []
+    for physical_index, name in enumerate(original_names):
+        semantic = _phasor_column(name)
+        if semantic is not None:
+            stem, kind = semantic
+            if stem not in phasor_columns:
+                phasor_columns[stem] = {}
+                phasor_order.append(stem)
+            if kind in phasor_columns[stem]:
+                raise ValueError(f"Colonne {kind} dupliquée pour le phasor {stem!r}")
+            phasor_columns[stem][kind] = (physical_index, name)
+            continue
         model_index = len(model_names)
         model_name = _readable_feature_name(name)
         model_names.append(model_name)
@@ -130,14 +144,13 @@ def build_feature_representation(
         ))
     phasors = []
     excluded_model_names = []
-    for physical_amplitude_index in range(
-        PMU_FIRST_PHASOR_INDEX,
-        len(original_names),
-        2,
-    ):
-        physical_phase_index = physical_amplitude_index + 1
-        amplitude_name = original_names[physical_amplitude_index]
-        phase_name = original_names[physical_phase_index]
+    for stem in phasor_order:
+        columns = phasor_columns[stem]
+        if set(columns) != {"ANG", "MAG"}:
+            missing = {"ANG", "MAG"} - set(columns)
+            raise ValueError(f"Phasor {stem!r} incomplet, colonne(s) manquante(s): {sorted(missing)}")
+        physical_phase_index, phase_name = columns["ANG"]
+        physical_amplitude_index, amplitude_name = columns["MAG"]
         readable_stem = _readable_feature_name(
             _phasor_name(amplitude_name, phase_name)
         )
@@ -318,6 +331,7 @@ def validate_checkpoint_model_dimension(
     checkpoint: dict,
     expected_dim: int,
     expected_feature_names=None,
+    expected_representation_version: Optional[str] = None,
 ) -> None:
     """Refuse explicitement les checkpoints d'une autre représentation."""
     saved_dim = checkpoint.get("model_x_dim")
@@ -338,9 +352,45 @@ def validate_checkpoint_model_dimension(
         and tuple(saved_feature_names) != tuple(expected_feature_names)
     ):
         raise ValueError("Checkpoint incompatible : les features modèle diffèrent")
+    saved_version = checkpoint.get("feature_representation")
+    if (
+        expected_representation_version is not None
+        and saved_version != expected_representation_version
+    ):
+        raise ValueError(
+            "Checkpoint incompatible : la sémantique ANG/MAG a changé "
+            f"({saved_version!r} reçu, {expected_representation_version!r} attendu). "
+            "Relancez l'entraînement depuis scratch."
+        )
 
 
-def notre_data_tri(data_file_path, exclude_zero_sequence_phase: bool = False):
+def resolve_data_column_order(columns, data_column_order) -> list[str]:
+    """Associe sans ambiguïté l'ordre configuré aux noms réels du CSV."""
+    available = [str(column) for column in columns]
+    resolved = []
+    for expected in data_column_order:
+        expected_upper = str(expected).upper()
+        candidates = [
+            actual for actual in available
+            if actual.upper() == expected_upper
+            or actual.upper().endswith(":" + expected_upper)
+        ]
+        if len(candidates) != 1:
+            qualifier = "manquante" if not candidates else "ambiguë"
+            raise ValueError(
+                f"Colonne configurée {expected!r} {qualifier}; candidats={candidates}"
+            )
+        resolved.append(candidates[0])
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("data_column_order associe plusieurs entrées à la même colonne")
+    return resolved
+
+
+def notre_data_tri(
+    data_file_path,
+    exclude_zero_sequence_phase: bool = False,
+    data_column_order=None,
+):
     df = pd.read_csv(data_file_path, sep=";")
 
     df["DATE_MESURE"] = pd.to_datetime(df["DATE_MESURE"])
@@ -359,13 +409,10 @@ def notre_data_tri(data_file_path, exclude_zero_sequence_phase: bool = False):
 
     print(excluded.shape)
 
-    cols_to_drop = [col for col in df.columns if
-                    not col.endswith("MAG") and
-                    not col.endswith("FREQ") and
-                    not col.endswith("DFDT") and
-                    not col.endswith("ANG")]
-
-    df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+    if not data_column_order:
+        raise ValueError("data_column_order est obligatoire pour les données PMU")
+    selected_columns = resolve_data_column_order(df.columns, data_column_order)
+    df = df.loc[:, selected_columns]
 
     representation = build_feature_representation(
         df.columns,
@@ -386,9 +433,17 @@ def notre_data_tri(data_file_path, exclude_zero_sequence_phase: bool = False):
     return data, excluded, representation
 
 
-def get_data_simple(data_file_path, exclude_zero_sequence_phase: bool = False):
+def get_data_simple(
+    data_file_path,
+    exclude_zero_sequence_phase: bool = False,
+    data_column_order=None,
+):
     """Charge un CSV PMU avec exactement la même représentation que get_data."""
-    return notre_data_tri(data_file_path, exclude_zero_sequence_phase)
+    return notre_data_tri(
+        data_file_path,
+        exclude_zero_sequence_phase,
+        data_column_order,
+    )
 
 
 def to_numpy(data) -> np.ndarray:
@@ -504,6 +559,7 @@ def get_data(
         train_start: int = 0,
         return_metadata: bool = False,
         exclude_zero_sequence_phase: bool = False,
+        data_column_order=None,
 ):
     """
     Charge les données d'entraînement et de test.
@@ -539,6 +595,7 @@ def get_data(
     DATA, excluded, representation = get_data_simple(
         data_directory,
         exclude_zero_sequence_phase=exclude_zero_sequence_phase,
+        data_column_order=data_column_order,
     )
 
     physical_dim = get_data_dim(dataset)
