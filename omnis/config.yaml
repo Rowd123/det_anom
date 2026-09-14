@@ -1,0 +1,103 @@
+# Dataset
+dataset: PMU
+data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
+# Suffixes ordonnés des noms réels du CSV (le préfixe de poste est conservé).
+data_column_order:
+  - DFDT
+  - FREQ
+  - I0.ANG
+  - I0.MAG
+  - I1.ANG
+  - I1.MAG
+  - I2.ANG
+  - I2.MAG
+  - V0.ANG
+  - V0.MAG
+  - V1.ANG
+  - V1.MAG
+  - V2.ANG
+  - V2.MAG
+# Dérivé à l'exécution de FeatureRepresentation.
+x_dim: null
+exclude_zero_sequence_phase: false
+
+# Architecture
+use_connected_z_q: true
+use_connected_z_p: true
+
+# Paramètres du modèle
+z_dim: 3
+rnn_cell: GRU
+rnn_num_hidden: 500
+window_length: 100
+dense_dim: 500
+
+# Les normalizing flows ne sont pas encore réimplémentés.
+posterior_flow_type: null
+nf_layers: 20
+
+std_epsilon: 0.005
+decoder_sigma_mode: fixed  # learned pour restaurer le comportement historique
+decoder_fixed_sigma: 0.05
+
+# Entraînement
+run_mode: scratch  # scratch, resume ou evaluate
+restore_checkpoint: model/best_omni_anomaly.pt
+max_epoch: 50
+max_step: null
+train_start: 0
+max_train_size: 0.8
+batch_size: 50
+valid_batch_size: 50
+# Affichage léger des moyennes cumulées toutes les 100 mises à jour.
+train_log_step_freq: 100
+train_n_z: 1
+valid_n_z: 8
+deep_training_diagnostics: false
+
+# Filtrage robuste des fenêtres probablement anormales
+anomaly_filter_enabled: false
+anomaly_filter_warmup_epochs: 2
+anomaly_filter_k: 5.0
+anomaly_filter_history_size: 10000
+anomaly_filter_min_history: 1000
+
+initial_lr: 0.0001
+lr_anneal_factor: 0.5
+lr_anneal_epoch_freq: 10
+
+l2_reg: 0.0001
+gradient_clip_norm: 50
+
+early_stop: true
+# Nombre d'époques consécutives sans amélioration de valid_loss.
+early_stopping_validation_patience: 10
+valid_portion: 0.3
+
+# Évaluation
+test_n_z: 16
+test_batch_size: 32
+max_test_size: null
+
+get_score_on_dim: false
+
+# Recherche du meilleur seuil
+bf_search_min: -400.0
+bf_search_max: 400.0
+bf_search_step_size: 1.0
+
+# POT
+level: 0.01
+pot_q: 0.001
+
+# Appareil
+device: null
+
+# Résultats et sauvegardes
+save_z: false
+save_dir: model
+result_dir: result
+
+train_score_filename: train_score.pkl
+test_score_filename: test_score.pkl
+metrics_filename: metrics.json

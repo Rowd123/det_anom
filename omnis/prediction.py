@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from omni_anomaly.utils import BatchSlidingWindow
+from utils import BatchSlidingWindow
 
 
 class Predictor:
@@ -40,6 +40,7 @@ class Predictor:
         batch_size: int = 32,
         last_point_only: bool = True,
         device: Optional[str | torch.device] = None,
+        scaler=None,
     ):
         if n_z < 1:
             raise ValueError(
@@ -55,6 +56,7 @@ class Predictor:
         self._n_z = n_z
         self._batch_size = batch_size
         self._last_point_only = last_point_only
+        self.scaler = scaler
 
         if device is None:
             try:
@@ -83,6 +85,7 @@ class Predictor:
         self,
         values,
         excludes: Optional[Tensor] = None,
+        normalized: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         """
         Calcule les scores de reconstruction.
@@ -106,6 +109,13 @@ class Predictor:
         mean_prediction_time:
             Temps moyen par mini-batch.
         """
+        if not normalized:
+            if self.scaler is None or not self.scaler.fitted:
+                raise RuntimeError(
+                    "Un scaler ajusté est obligatoire pour traiter des données brutes"
+                )
+            values = self.scaler.transform(values)
+
         values = torch.as_tensor(
             values,
             dtype=torch.float32,
@@ -115,6 +125,11 @@ class Predictor:
             raise ValueError(
                 "values doit avoir la forme [temps, x_dim]"
             )
+        if values.shape[1] != self.model.x_dims:
+            raise ValueError(
+                f"values contient {values.shape[1]} dimensions, "
+                f"mais le modèle en attend {self.model.x_dims}"
+            )
 
         if len(values) < self.model.window_length:
             raise ValueError(
@@ -122,6 +137,7 @@ class Predictor:
             )
 
         if excludes is not None:
+            excludes = np.array(excludes)
             excludes = torch.as_tensor(
                 excludes,
                 dtype=torch.bool,

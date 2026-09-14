@@ -5,7 +5,10 @@ from torch import Tensor, nn
 
 import pyro.distributions as dist
 
-from units import GaussianRandomWalk, DistributionParameterNetwork
+from units import (
+    DistributionParameterNetwork,
+    GaussianRandomWalk,
+)
 from units import RecurrentPosteriorInputNetwork, RNNNetwork, SoftplusStd
 from recurrent_distributions import RecurrentDistribution
 from vae import VAE
@@ -123,6 +126,8 @@ class OmniAnomaly(nn.Module):
             hidden_dim=config.dense_dim,
             output_dim=config.x_dim,
             std_epsilon=config.std_epsilon,
+            sigma_mode=config.decoder_sigma_mode,
+            fixed_sigma=config.decoder_fixed_sigma,
         )
 
         # ------------------------------------------------------------
@@ -195,6 +200,18 @@ class OmniAnomaly(nn.Module):
             objective="elbo",
         )
 
+    def get_per_window_loss(
+        self,
+        x: Tensor,
+        n_z: int = 1,
+        deep_diagnostics: bool = False,
+    ) -> dict[str, Tensor]:
+        return self.vae.get_per_window_loss(
+            x=x,
+            n_z=n_z,
+            deep_diagnostics=deep_diagnostics,
+        )
+
     @torch.no_grad()
     def get_score(
         self,
@@ -260,5 +277,3 @@ class OmniAnomaly(nn.Module):
             )
 
         return reconstruction_log_prob, z_statistics
-
-
