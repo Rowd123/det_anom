@@ -1,0 +1,49 @@
+# Données et représentation (doivent correspondre au checkpoint)
+dataset: PMU
+data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
+# Suffixes ordonnés des noms réels du CSV (le préfixe de poste est conservé).
+data_column_order:
+  - ROCOF
+  - FREQ
+  - I0.ANG
+  - I0.MAG
+  - I1.ANG
+  - I1.MAG
+  - I2.ANG
+  - I2.MAG
+  - V0.ANG
+  - V0.MAG
+  - V1.ANG
+  - V1.MAG
+  - V2.ANG
+  - V2.MAG
+x_dim: null  # dérivé de la représentation au chargement
+exclude_zero_sequence_phase: true
+
+# Architecture du checkpoint
+use_connected_z_q: true
+use_connected_z_p: true
+z_dim: 3
+rnn_num_hidden: 500
+window_length: 100
+dense_dim: 500
+std_epsilon: 0.005
+decoder_sigma_mode: fixed
+decoder_fixed_sigma: 0.05
+get_score_on_dim: false
+
+# Découpage des données identique à l'entraînement
+train_start: 0
+max_train_size: 0.8
+max_test_size: null
+
+# Visualisation (les options CLI correspondantes ont priorité)
+checkpoint: model/best_omni_anomaly.pt
+split: test
+start: 99
+points: 1000
+batch_size: 32
+n_z: 16
+device: null
+backend: matplotlib
+output: null

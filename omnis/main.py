@@ -122,8 +122,37 @@ def main(config) -> None:
         max_test_size=config.max_test_size,
         train_start=config.train_start,
         return_metadata=True,
+        exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
+        data_column_order=config.data_column_order,
     )
     config.x_dim = feature_representation.model_dim
+
+    print(f"Physical dimension: {feature_representation.physical_dim}")
+    print(f"Model dimension: {feature_representation.model_dim}")
+    print("\nPhysical input order:")
+    for index, feature_name in enumerate(feature_representation.original_names):
+        print(f"{index}  {feature_name}")
+    print("\nPhasor mapping:")
+    for phasor in feature_representation.phasors:
+        sequence = (
+            f"sequence {phasor.sequence}"
+            if phasor.sequence is not None
+            else "unclassified"
+        )
+        phase_status = "phase included" if phasor.includes_phase else "phase excluded"
+        print(
+            f"- {sequence}: phase={phasor.phase_name}, "
+            f"magnitude={phasor.amplitude_name}, {phase_status}"
+        )
+    print("\nModel features:")
+    for feature_name in feature_representation.model_names:
+        print(f"- {feature_name}")
+    print("\nExcluded from model representation:")
+    if feature_representation.excluded_model_names:
+        for feature_name in feature_representation.excluded_model_names:
+            print(f"- {feature_name}")
+    else:
+        print("- none")
 
     # Conserver la configuration réellement utilisée, dimension dérivée incluse.
     with (result_directory / "config.yaml").open("w", encoding="utf-8") as file:
@@ -146,6 +175,7 @@ def main(config) -> None:
         batch_size=config.batch_size,
         valid_batch_size=config.valid_batch_size,
         train_log_step_freq=config.train_log_step_freq,
+        deep_training_diagnostics=config.deep_training_diagnostics,
         initial_lr=config.initial_lr,
         lr_anneal_epochs=config.lr_anneal_epoch_freq,
         lr_anneal_factor=config.lr_anneal_factor,
