@@ -20,6 +20,8 @@ posterior_flow_type: null
 nf_layers: 20
 
 std_epsilon: 0.005
+decoder_sigma_mode: fixed  # learned pour restaurer le comportement historique
+decoder_fixed_sigma: 0.05
 
 # Entraînement
 run_mode: scratch  # scratch, resume ou evaluate
@@ -42,12 +44,12 @@ anomaly_filter_k: 5.0
 anomaly_filter_history_size: 10000
 anomaly_filter_min_history: 1000
 
-initial_lr: 0.0005
+initial_lr: 0.0001
 lr_anneal_factor: 0.5
 lr_anneal_epoch_freq: 10
 
 l2_reg: 0.0001
-gradient_clip_norm: 1000
+gradient_clip_norm: 50
 
 early_stop: true
 # Nombre d'époques consécutives sans amélioration de valid_loss.
