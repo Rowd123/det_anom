@@ -19,7 +19,7 @@ dense_dim: 500
 posterior_flow_type: null
 nf_layers: 20
 
-std_epsilon: 0.0001
+std_epsilon: 0.005
 
 # Entraînement
 run_mode: scratch  # scratch, resume ou evaluate
@@ -36,7 +36,7 @@ train_n_z: 1
 valid_n_z: 8
 
 # Filtrage robuste des fenêtres probablement anormales
-anomaly_filter_enabled: true
+anomaly_filter_enabled: false
 anomaly_filter_warmup_epochs: 2
 anomaly_filter_k: 5.0
 anomaly_filter_history_size: 10000
@@ -47,7 +47,7 @@ lr_anneal_factor: 0.5
 lr_anneal_epoch_freq: 10
 
 l2_reg: 0.0001
-gradient_clip_norm: null
+gradient_clip_norm: 1000
 
 early_stop: true
 # Nombre d'époques consécutives sans amélioration de valid_loss.
