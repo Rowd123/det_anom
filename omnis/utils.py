@@ -365,16 +365,21 @@ def validate_checkpoint_model_dimension(
 
 
 def resolve_data_column_order(columns, data_column_order) -> list[str]:
-    """Associe sans ambiguïté l'ordre configuré aux noms réels du CSV."""
+    """Associe les suffixes configurés aux noms réels complets du CSV."""
     available = [str(column) for column in columns]
     resolved = []
     for expected in data_column_order:
         expected_upper = str(expected).upper()
-        candidates = [
-            actual for actual in available
-            if actual.upper() == expected_upper
-            or actual.upper().endswith(":" + expected_upper)
-        ]
+        candidates = []
+        for actual in available:
+            actual_upper = actual.upper()
+            if not actual_upper.endswith(expected_upper):
+                continue
+            prefix = actual_upper[:-len(expected_upper)]
+            # Le suffixe doit être un token complet, pas la fin accidentelle
+            # d'un autre identifiant (par exemple NOTFREQ ne matche pas FREQ).
+            if not prefix or not prefix[-1].isalnum():
+                candidates.append(actual)
         if len(candidates) != 1:
             qualifier = "manquante" if not candidates else "ambiguë"
             raise ValueError(

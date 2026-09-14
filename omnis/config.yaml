@@ -1,6 +1,7 @@
 # Dataset
 dataset: PMU
 data_dir: ../Mesures_OH_PDC_MANTRA_VIGY_1__20260828-080000_20260828-110000__50Hz.csv
+# Suffixes ordonnés des noms réels du CSV (le préfixe de poste est conservé).
 data_column_order:
   - ROCOF
   - FREQ

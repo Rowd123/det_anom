@@ -218,10 +218,23 @@ def test_correct_ang_mag_semantics_and_scaling_round_trip():
 
 def test_configured_column_order_reorders_real_columns_and_rejects_missing():
     configured = corrected_columns()
-    actual = [f"VIGY_1:{name}" for name in reversed(configured)]
+    actual = [
+        (
+            f"VIGY_1:VA_{name}"
+            if name.startswith("V")
+            else f"VIGY_1:IA_{name}"
+            if name.startswith("I")
+            else f"VIGY_1:{name}"
+        )
+        for name in reversed(configured)
+    ]
     assert resolve_data_column_order(actual, configured) == list(reversed(actual))
     with np.testing.assert_raises_regex(ValueError, "manquante"):
         resolve_data_column_order(actual[:-1], configured)
+    with np.testing.assert_raises_regex(ValueError, "ambiguë"):
+        resolve_data_column_order(actual + ["OTHER:FREQ"], configured)
+    with np.testing.assert_raises_regex(ValueError, "manquante"):
+        resolve_data_column_order(["NOTFREQ"], ["FREQ"])
 
 
 def test_semantically_old_checkpoint_is_rejected_even_with_same_dimension():
