@@ -55,7 +55,8 @@ decoder_fixed_sigma: 0.05
 
 # Entraînement
 run_mode: scratch  # scratch, resume ou evaluate
-restore_checkpoint: model/best_omni_anomaly.pt
+# En resume/evaluate, recopier ici le chemin paramétré affiché par le run.
+restore_checkpoint: null
 max_epoch: 50
 max_step: null
 train_start: 0

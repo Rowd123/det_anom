@@ -1,8 +1,10 @@
 # main.py
 
+import hashlib
 import json
 import logging
 import pickle
+import re
 from argparse import ArgumentParser
 from pathlib import Path
 from pprint import pprint
@@ -18,6 +20,44 @@ from model import OmniAnomaly
 from prediction import Predictor
 from trainer import Trainer
 from utils import build_normalizer, get_data, save_z
+
+
+def _filename_token(value) -> str:
+    """Convertit une valeur de configuration en composante de nom portable."""
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value)).strip("-_.")
+    return token.lower() or "none"
+
+
+def best_checkpoint_filename(config, feature_representation) -> str:
+    """Nomme le meilleur modèle à partir des paramètres qui le rendent incompatible.
+
+    La liste complète des features est représentée par une empreinte stable afin
+    de garder un nom lisible même lorsque beaucoup de grandeurs sont utilisées.
+    Les exclusions restent visibles pour faciliter les comparaisons de runs.
+    """
+    feature_names = "\n".join(feature_representation.model_names).encode("utf-8")
+    feature_digest = hashlib.sha256(feature_names).hexdigest()[:8]
+    excluded = sorted(
+        (_filename_token(name) for name in getattr(config, "excluded_features", []))
+    )
+    if getattr(config, "exclude_zero_sequence_phase", False):
+        excluded.append("zero-sequence-phase")
+    exclusion_token = "+".join(excluded) if excluded else "none"
+    if len(exclusion_token) > 64:
+        exclusion_digest = hashlib.sha256(exclusion_token.encode("utf-8")).hexdigest()[:8]
+        exclusion_token = f"multiple-{exclusion_digest}"
+
+    parts = (
+        "best_omni_anomaly",
+        f"norm-{_filename_token(getattr(config, 'normalization_mode', 'train_minmax'))}",
+        f"features-{feature_representation.model_dim}-{feature_digest}",
+        f"excl-{exclusion_token}",
+        f"window-{config.window_length}",
+        f"z-{config.z_dim}",
+        f"rnn-{_filename_token(config.rnn_cell)}-{config.rnn_num_hidden}",
+        f"decoder-{_filename_token(config.decoder_sigma_mode)}",
+    )
+    return "__".join(parts) + ".pt"
 
 
 def load_config(path: str | Path) -> SimpleNamespace:
@@ -133,6 +173,12 @@ def main(config) -> None:
         feature_representation,
         getattr(config, "nominal_normalization", None),
     )
+    best_checkpoint_path = (
+        save_directory / best_checkpoint_filename(config, feature_representation)
+        if save_directory is not None else None
+    )
+    if best_checkpoint_path is not None:
+        print(f"Best checkpoint path: {best_checkpoint_path}")
 
     print(f"Physical dimension: {feature_representation.physical_dim}")
     print(f"Model dimension: {feature_representation.model_dim}")
@@ -246,12 +292,10 @@ def main(config) -> None:
             values=x_train,
             valid_portion=config.valid_portion,
             excludes=x_train_exclude,
-            checkpoint_path=(
-                save_directory / "best_omni_anomaly.pt"
-                if save_directory is not None
-                else None
-            ),
+            checkpoint_path=best_checkpoint_path,
         )
+        if best_checkpoint_path is not None:
+            metrics["best_checkpoint"] = str(best_checkpoint_path)
 
         training_duration = (
             perf_counter() - training_start
