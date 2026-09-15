@@ -41,6 +41,7 @@ class Predictor:
         last_point_only: bool = True,
         device: Optional[str | torch.device] = None,
         scaler=None,
+        normalizer=None,
     ):
         if n_z < 1:
             raise ValueError(
@@ -56,7 +57,8 @@ class Predictor:
         self._n_z = n_z
         self._batch_size = batch_size
         self._last_point_only = last_point_only
-        self.scaler = scaler
+        self.normalizer = normalizer or scaler
+        self.scaler = self.normalizer
 
         if device is None:
             try:
@@ -110,11 +112,12 @@ class Predictor:
             Temps moyen par mini-batch.
         """
         if not normalized:
-            if self.scaler is None or not self.scaler.fitted:
+            if self.normalizer is None or not self.normalizer.fitted:
                 raise RuntimeError(
                     "Un scaler ajusté est obligatoire pour traiter des données brutes"
                 )
-            values = self.scaler.transform(values)
+            if not self.normalizer.requires_windows:
+                values, _ = self.normalizer.transform(values)
 
         values = torch.as_tensor(
             values,
@@ -166,6 +169,8 @@ class Predictor:
         iterator = sliding_window.get_iterator([values])
 
         for (batch_x,) in iterator:
+            if not normalized and self.normalizer.requires_windows:
+                batch_x, _ = self.normalizer.transform(batch_x)
             batch_x = batch_x.to(
                 device=self._device,
                 dtype=torch.float32,

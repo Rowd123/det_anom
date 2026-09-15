@@ -17,7 +17,7 @@ from eval import bf_search, pot_eval
 from model import OmniAnomaly
 from prediction import Predictor
 from trainer import Trainer
-from utils import get_data, save_z
+from utils import build_normalizer, get_data, save_z
 
 
 def load_config(path: str | Path) -> SimpleNamespace:
@@ -124,8 +124,15 @@ def main(config) -> None:
         return_metadata=True,
         exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
         data_column_order=config.data_column_order,
+        excluded_features=getattr(config, "excluded_features", []),
     )
     config.x_dim = feature_representation.model_dim
+    config.normalization_mode = getattr(config, "normalization_mode", "train_minmax")
+    normalizer = build_normalizer(
+        config.normalization_mode,
+        feature_representation,
+        getattr(config, "nominal_normalization", None),
+    )
 
     print(f"Physical dimension: {feature_representation.physical_dim}")
     print(f"Model dimension: {feature_representation.model_dim}")
@@ -193,6 +200,7 @@ def main(config) -> None:
         anomaly_filter_min_history=config.anomaly_filter_min_history,
         device=config.device,
         feature_names=feature_representation.model_names,
+        normalizer=normalizer,
     )
 
     predictor = Predictor(
@@ -201,7 +209,7 @@ def main(config) -> None:
         batch_size=config.test_batch_size,
         last_point_only=True,
         device=config.device,
-        scaler=trainer.scaler,
+        normalizer=trainer.normalizer,
     )
 
     metrics = {}

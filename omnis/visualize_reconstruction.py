@@ -17,9 +17,8 @@ import yaml
 from model import OmniAnomaly
 from utils import (
     FEATURE_REPRESENTATION_VERSION,
-    MinMaxScaler,
+    build_normalizer,
     get_data,
-    inverse_transform_physical,
     phase_embedding_to_phasor,
     validate_checkpoint_model_dimension,
 )
@@ -46,7 +45,8 @@ def physical_reconstruction_indices(representation):
     """Retourne uniquement les grandeurs physiques réellement reconstructibles."""
     indices = [feature.physical_index for feature in representation.direct_features]
     for phasor in representation.phasors:
-        indices.append(phasor.physical_amplitude_index)
+        if phasor.includes_amplitude:
+            indices.append(phasor.physical_amplitude_index)
         if phasor.includes_phase:
             indices.append(phasor.physical_phase_index)
     return indices
@@ -55,7 +55,8 @@ def physical_reconstruction_indices(representation):
 @torch.inference_mode()
 def reconstruct_last_points(
     model,
-    normalized_values,
+    values,
+    normalizer,
     excludes,
     start: int,
     point_count: int,
@@ -65,7 +66,7 @@ def reconstruct_last_points(
 ):
     """Reconstruit chaque point demandé à partir de sa fenêtre causale."""
     window_length = model.window_length
-    end = min(start + point_count, len(normalized_values))
+    end = min(start + point_count, len(values))
     if start < window_length - 1:
         raise ValueError(
             f"start doit être au moins égal à {window_length - 1}"
@@ -82,7 +83,7 @@ def reconstruct_last_points(
     if not valid_targets.any():
         raise ValueError("Aucune fenêtre valide dans la plage demandée")
     reconstruction = torch.full(
-        (end - start, normalized_values.shape[1]),
+        (end - start, values.shape[1]),
         float("nan"),
         dtype=torch.float32,
     )
@@ -90,14 +91,18 @@ def reconstruct_last_points(
     model.eval()
     for batch_start in range(0, len(valid_window_indices), batch_size):
         indices = valid_window_indices[batch_start:batch_start + batch_size]
-        windows = normalized_values[indices].to(device)
+        windows = values[indices].to(device)
+        normalized_windows, context = normalizer.transform(windows)
         reconstructed = model.vae.reconstruct(
-            windows,
+            normalized_windows,
             n_z=n_z,
             use_mean=True,
         ).mean(dim=0)
         positions = valid_positions[batch_start:batch_start + batch_size]
-        reconstruction[positions] = reconstructed[:, -1].cpu()
+        reconstructed_physical_embedding = normalizer.inverse_transform(
+            reconstructed[:, -1:], context
+        )[:, -1]
+        reconstruction[positions] = reconstructed_physical_embedding.cpu()
 
     return target_indices, reconstruction
 
@@ -216,11 +221,18 @@ def main(arguments):
         return_metadata=True,
         exclude_zero_sequence_phase=config.exclude_zero_sequence_phase,
         data_column_order=config.data_column_order,
+        excluded_features=getattr(config, "excluded_features", []),
     )
     values, _, excludes = train if split == "train" else test
     if values is None:
         raise ValueError(f"La partie {split} est vide")
     config.x_dim = representation.model_dim
+    config.normalization_mode = getattr(config, "normalization_mode", "train_minmax")
+    normalizer = build_normalizer(
+        config.normalization_mode,
+        representation,
+        getattr(config, "nominal_normalization", None),
+    )
 
     checkpoint_path = resolve_from_config(checkpoint, config_path)
     device = torch.device(
@@ -235,14 +247,22 @@ def main(arguments):
         expected_feature_names=representation.model_names,
         expected_representation_version=FEATURE_REPRESENTATION_VERSION,
     )
+    saved_mode = state.get("normalization_mode", "train_minmax")
+    if saved_mode != normalizer.mode:
+        raise ValueError(
+            f"Checkpoint incompatible : normalization_mode={saved_mode!r}, "
+            f"configuration courante={normalizer.mode!r}"
+        )
     model = OmniAnomaly(config).to(device)
     model.load_state_dict(state["model_state_dict"])
-    scaler = MinMaxScaler().load_state_dict(state["scaler_state_dict"])
-
-    normalized_values = scaler.transform(values)
-    indices, normalized_reconstruction = reconstruct_last_points(
+    normalizer.load_checkpoint_state(
+        state.get("normalizer_state_dict", state.get("scaler_state_dict", {}))
+    )
+    values = torch.as_tensor(values, dtype=torch.float32)
+    indices, reconstructed_embedding = reconstruct_last_points(
         model=model,
-        normalized_values=normalized_values,
+        values=values,
+        normalizer=normalizer,
         excludes=excludes,
         start=start,
         point_count=points,
@@ -252,10 +272,8 @@ def main(arguments):
     )
     selected_values = values[indices]
     observed = phase_embedding_to_phasor(selected_values, representation).numpy()
-    reconstructed = inverse_transform_physical(
-        normalized_reconstruction,
-        scaler,
-        representation,
+    reconstructed = phase_embedding_to_phasor(
+        reconstructed_embedding, representation
     ).numpy()
     mse = physical_squared_errors(observed, reconstructed, representation)
 
