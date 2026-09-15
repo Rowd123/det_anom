@@ -20,6 +20,19 @@ data_column_order:
 # Dérivé à l'exécution de FeatureRepresentation.
 x_dim: null
 exclude_zero_sequence_phase: false
+excluded_features: []
+
+# train_minmax (historique), nominal (références ci-dessous), window_local.
+normalization_mode: train_minmax
+nominal_normalization:
+  DFDT: {center: 0.0, scale: 1.0}
+  FREQ: {center: 50.0, scale: 0.5}
+  I0.MAG: {center: 0.0, scale: 1.0}
+  I1.MAG: {center: 0.0, scale: 1.0}
+  I2.MAG: {center: 0.0, scale: 1.0}
+  V0.MAG: {center: 0.0, scale: 240000.0}
+  V1.MAG: {center: 0.0, scale: 240000.0}
+  V2.MAG: {center: 0.0, scale: 240000.0}
 
 # Architecture
 use_connected_z_q: true
@@ -42,7 +55,8 @@ decoder_fixed_sigma: 0.05
 
 # Entraînement
 run_mode: scratch  # scratch, resume ou evaluate
-restore_checkpoint: model/best_omni_anomaly.pt
+# En resume/evaluate, recopier ici le chemin paramétré affiché par le run.
+restore_checkpoint: null
 max_epoch: 50
 max_step: null
 train_start: 0
