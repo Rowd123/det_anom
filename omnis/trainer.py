@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from utils import (
     FEATURE_REPRESENTATION_VERSION,
     BatchSlidingWindow,
-    MinMaxScaler,
+    TrainMinMaxNormalizer,
     validate_checkpoint_model_dimension,
 )
 
@@ -164,6 +164,7 @@ class Trainer:
         anomaly_filter_min_history: int = 1000,
         device: Optional[str | torch.device] = None,
         feature_names=None,
+        normalizer=None,
     ):
         if max_epoch is None and max_step is None:
             raise ValueError("max_epoch ou max_step doit être défini")
@@ -203,7 +204,9 @@ class Trainer:
         self._feature_names = tuple(
             feature_names or (f"feature_{index}" for index in range(model.x_dims))
         )
-        self.scaler = MinMaxScaler()
+        self.normalizer = normalizer or TrainMinMaxNormalizer()
+        # Alias historique pour les appelants externes.
+        self.scaler = self.normalizer
 
         self._device = torch.device(
             device
@@ -281,6 +284,8 @@ class Trainer:
 
     def _training_step(self, batch_x: Tensor, epoch: int) -> dict[str, float]:
         self._model.train()
+        if self.normalizer.requires_windows:
+            batch_x, _ = self.normalizer.transform(batch_x)
         batch_x = batch_x.to(device=self._device, dtype=torch.float32)
         self._optimizer.zero_grad(set_to_none=True)
 
@@ -385,6 +390,8 @@ class Trainer:
         observations = 0
 
         for (batch_x,) in valid_iterator.get_iterator([valid_values]):
+            if self.normalizer.requires_windows:
+                batch_x, _ = self.normalizer.transform(batch_x)
             batch_x = batch_x.to(device=self._device, dtype=torch.float32)
             components = self._model.get_per_window_loss(
                 x=batch_x,
@@ -469,10 +476,11 @@ class Trainer:
 
         # Le split temporel précède le fit : le scaler de l'embedding ne voit que
         # les observations valides de la partie entraînement.
-        if not self.scaler.fitted:
-            self.scaler.fit(train_values, train_excludes)
-        train_values = self.scaler.transform(train_values)
-        valid_values = self.scaler.transform(valid_values)
+        if not self.normalizer.fitted:
+            self.normalizer.fit(train_values, train_excludes)
+        if not self.normalizer.requires_windows:
+            train_values, _ = self.normalizer.transform(train_values)
+            valid_values, _ = self.normalizer.transform(valid_values)
 
         train_sliding_window = BatchSlidingWindow(
             array_size=len(train_values),
@@ -724,7 +732,13 @@ class Trainer:
                 ),
                 "global_step": self._global_step,
                 "epoch": self._epoch,
-                "scaler_state_dict": self.scaler.state_dict(),
+                "normalization_mode": self.normalizer.mode,
+                "normalizer_state_dict": self.normalizer.checkpoint_state(),
+                # Conservé pour la lecture des checkpoints train_minmax historiques.
+                "scaler_state_dict": (
+                    self.normalizer.checkpoint_state()
+                    if self.normalizer.mode == "train_minmax" else None
+                ),
                 "loss_history": list(self._loss_history),
                 "model_x_dim": self._model.x_dims,
                 "feature_representation": FEATURE_REPRESENTATION_VERSION,
@@ -739,10 +753,11 @@ class Trainer:
             map_location=self._device,
             weights_only=True,
         )
-        if "scaler_state_dict" not in checkpoint:
+        saved_mode = checkpoint.get("normalization_mode", "train_minmax")
+        if saved_mode != self.normalizer.mode:
             raise ValueError(
-                "Ce checkpoint ancien ne contient pas le scaler requis pour "
-                "une reprise ou une inférence sûre"
+                f"Checkpoint incompatible : normalization_mode={saved_mode!r}, "
+                f"configuration courante={self.normalizer.mode!r}"
             )
 
         validate_checkpoint_model_dimension(
@@ -761,6 +776,11 @@ class Trainer:
             self._scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self._global_step = checkpoint["global_step"]
         self._epoch = checkpoint.get("epoch", 0)
-        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        normalizer_state = checkpoint.get(
+            "normalizer_state_dict", checkpoint.get("scaler_state_dict")
+        )
+        if normalizer_state is None:
+            raise ValueError("Checkpoint dépourvu de paramètres de normalisation")
+        self.normalizer.load_checkpoint_state(normalizer_state)
         self._loss_history.clear()
         self._loss_history.extend(checkpoint.get("loss_history", []))

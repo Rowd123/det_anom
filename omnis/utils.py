@@ -28,7 +28,7 @@ class PhasorFeatureMapping:
     phase_sin_name: str
     physical_amplitude_index: int
     physical_phase_index: int
-    model_amplitude_index: int
+    model_amplitude_index: Optional[int]
     model_phase_cos_index: Optional[int]
     model_phase_sin_index: Optional[int]
     sequence: Optional[int]
@@ -36,6 +36,10 @@ class PhasorFeatureMapping:
     @property
     def includes_phase(self) -> bool:
         return self.model_phase_cos_index is not None
+
+    @property
+    def includes_amplitude(self) -> bool:
+        return self.model_amplitude_index is not None
 
 
 @dataclass(frozen=True)
@@ -65,7 +69,7 @@ class FeatureRepresentation:
         return len(self.model_names)
 
 
-FEATURE_REPRESENTATION_VERSION = "phasor_ang_mag_corrected_v3"
+FEATURE_REPRESENTATION_VERSION = "configurable_features_normalization_v4"
 _KIND_PATTERN = re.compile(r"(?i)(ANG|MAG)$")
 
 
@@ -115,11 +119,17 @@ def _phasor_sequence(amplitude_name: str, phase_name: str) -> Optional[int]:
 def build_feature_representation(
     column_names,
     exclude_zero_sequence_phase: bool = False,
+    excluded_features=None,
 ) -> FeatureRepresentation:
     """Construit les couples PMU uniquement à partir des suffixes ANG et MAG."""
     original_names = tuple(str(name) for name in column_names)
+    excluded = {str(name).upper() for name in (excluded_features or ())}
+    unknown = excluded - {name.upper() for name in original_names}
+    if unknown:
+        raise ValueError(f"excluded_features contient des noms inconnus: {sorted(unknown)}")
     model_names = []
     direct_features = []
+    excluded_model_names = []
     phasor_columns = {}
     phasor_order = []
     for physical_index, name in enumerate(original_names):
@@ -133,6 +143,9 @@ def build_feature_representation(
                 raise ValueError(f"Colonne {kind} dupliquée pour le phasor {stem!r}")
             phasor_columns[stem][kind] = (physical_index, name)
             continue
+        if name.upper() in excluded:
+            excluded_model_names.append(_readable_feature_name(name))
+            continue
         model_index = len(model_names)
         model_name = _readable_feature_name(name)
         model_names.append(model_name)
@@ -143,7 +156,7 @@ def build_feature_representation(
             model_index=model_index,
         ))
     phasors = []
-    excluded_model_names = []
+    # La liste a déjà reçu les variables directes exclues ci-dessus.
     for stem in phasor_order:
         columns = phasor_columns[stem]
         if set(columns) != {"ANG", "MAG"}:
@@ -155,10 +168,14 @@ def build_feature_representation(
             _phasor_name(amplitude_name, phase_name)
         )
         sequence = _phasor_sequence(amplitude_name, phase_name)
-        include_phase = not (exclude_zero_sequence_phase and sequence == 0)
-        model_amplitude_index = len(model_names)
-        model_phase_cos_index = len(model_names) + 1 if include_phase else None
-        model_phase_sin_index = len(model_names) + 2 if include_phase else None
+        include_phase = phase_name.upper() not in excluded and not (
+            exclude_zero_sequence_phase and sequence == 0
+        )
+        include_amplitude = amplitude_name.upper() not in excluded
+        model_amplitude_index = len(model_names) if include_amplitude else None
+        next_index = len(model_names) + int(include_amplitude)
+        model_phase_cos_index = next_index if include_phase else None
+        model_phase_sin_index = next_index + 1 if include_phase else None
         mapping = PhasorFeatureMapping(
             amplitude_name=amplitude_name,
             phase_name=phase_name,
@@ -173,7 +190,10 @@ def build_feature_representation(
             sequence=sequence,
         )
         phasors.append(mapping)
-        model_names.append(mapping.model_amplitude_name)
+        if include_amplitude:
+            model_names.append(mapping.model_amplitude_name)
+        else:
+            excluded_model_names.append(mapping.model_amplitude_name)
         if include_phase:
             model_names.extend((mapping.phase_cos_name, mapping.phase_sin_name))
         else:
@@ -197,8 +217,9 @@ def phasor_to_phase_embedding(data, representation: FeatureRepresentation):
     for feature in representation.direct_features:
         values[..., feature.model_index] = data[..., feature.physical_index]
     for phasor in representation.phasors:
-        amplitude = data[..., phasor.physical_amplitude_index]
-        values[..., phasor.model_amplitude_index] = amplitude
+        if phasor.includes_amplitude:
+            amplitude = data[..., phasor.physical_amplitude_index]
+            values[..., phasor.model_amplitude_index] = amplitude
         if phasor.includes_phase and is_tensor:
             phase = data[..., phasor.physical_phase_index]
             radians = torch.deg2rad(phase)
@@ -223,7 +244,7 @@ def phase_embedding_to_phasor(data, representation: FeatureRepresentation):
     for feature in representation.direct_features:
         values[..., feature.physical_index] = data[..., feature.model_index]
     for phasor in representation.phasors:
-        amplitude = data[..., phasor.model_amplitude_index]
+        amplitude = data[..., phasor.model_amplitude_index] if phasor.includes_amplitude else 0.0
         if phasor.includes_phase and is_tensor:
             cosine = data[..., phasor.model_phase_cos_index]
             sine = data[..., phasor.model_phase_sin_index]
@@ -327,6 +348,160 @@ class MinMaxScaler:
             raise RuntimeError("Le scaler doit être ajusté ou restauré avant utilisation")
 
 
+@dataclass(frozen=True)
+class NormalizationContext:
+    """Paramètres temporaires permettant d'inverser une transformation."""
+
+    minimum: Optional[Tensor] = None
+    maximum: Optional[Tensor] = None
+    center: Optional[Tensor] = None
+    scale: Optional[Tensor] = None
+
+
+class Normalizer:
+    mode: str
+    requires_windows = False
+
+    @property
+    def fitted(self) -> bool:
+        return True
+
+    def fit(self, data, excludes=None):
+        return self
+
+    def checkpoint_state(self) -> dict:
+        return {}
+
+    def load_checkpoint_state(self, state: dict):
+        if state:
+            raise ValueError(f"État inattendu pour la normalisation {self.mode}")
+        return self
+
+
+class TrainMinMaxNormalizer(Normalizer):
+    mode = "train_minmax"
+
+    def __init__(self):
+        self.scaler = MinMaxScaler()
+
+    @property
+    def fitted(self):
+        return self.scaler.fitted
+
+    def fit(self, data, excludes=None):
+        self.scaler.fit(data, excludes)
+        return self
+
+    def transform(self, data):
+        return self.scaler.transform(data), NormalizationContext(
+            minimum=self.scaler.minimum, maximum=self.scaler.maximum
+        )
+
+    def inverse_transform(self, data, context=None):
+        return self.scaler.inverse_transform(data)
+
+    def checkpoint_state(self):
+        return self.scaler.state_dict()
+
+    def load_checkpoint_state(self, state):
+        self.scaler.load_state_dict(state)
+        return self
+
+
+class NominalNormalizer(Normalizer):
+    mode = "nominal"
+
+    def __init__(self, center, scale):
+        self.center = torch.as_tensor(center, dtype=torch.float32).reshape(1, -1)
+        self.scale = torch.as_tensor(scale, dtype=torch.float32).reshape(1, -1)
+        if not torch.isfinite(self.center).all() or not torch.isfinite(self.scale).all():
+            raise ValueError("Les paramètres nominaux doivent être finis")
+        if (self.scale <= 0).any():
+            raise ValueError("Chaque scale nominal doit être strictement positif")
+
+    def _parameters_for(self, data):
+        data = torch.as_tensor(data, dtype=torch.float32)
+        if data.shape[-1] != self.center.shape[-1]:
+            raise ValueError("Dimension incompatible avec la normalisation nominale")
+        return data, self.center.to(data.device), self.scale.to(data.device)
+
+    def transform(self, data):
+        data, center, scale = self._parameters_for(data)
+        return torch.nan_to_num((data - center) / scale), NormalizationContext(
+            center=center, scale=scale
+        )
+
+    def inverse_transform(self, data, context=None):
+        data, center, scale = self._parameters_for(data)
+        return data * scale + center
+
+    def checkpoint_state(self):
+        return {"center": self.center.clone(), "scale": self.scale.clone()}
+
+    def load_checkpoint_state(self, state):
+        for name, expected in (("center", self.center), ("scale", self.scale)):
+            received = torch.as_tensor(state.get(name), dtype=torch.float32)
+            if received.shape != expected.shape or not torch.equal(received.cpu(), expected.cpu()):
+                raise ValueError(f"Checkpoint incompatible : paramètres nominaux {name} différents")
+        return self
+
+
+class WindowLocalNormalizer(Normalizer):
+    mode = "window_local"
+    requires_windows = True
+
+    def transform(self, data):
+        data = torch.as_tensor(data, dtype=torch.float32)
+        if data.ndim != 3:
+            raise ValueError("window_local attend [batch, window_length, features]")
+        minimum = data.amin(dim=1, keepdim=True)
+        maximum = data.amax(dim=1, keepdim=True)
+        difference = maximum - minimum
+        scale = torch.where(difference > 0, difference, torch.ones_like(difference))
+        return torch.nan_to_num((data - minimum) / scale), NormalizationContext(
+            minimum=minimum, maximum=maximum
+        )
+
+    def inverse_transform(self, data, context):
+        if context is None or context.minimum is None or context.maximum is None:
+            raise ValueError("Le contexte de la fenêtre est obligatoire")
+        data = torch.as_tensor(data, dtype=torch.float32)
+        minimum = context.minimum.to(data.device)
+        maximum = context.maximum.to(data.device)
+        return data * (maximum - minimum) + minimum
+
+
+def build_normalizer(mode, representation, nominal_normalization=None):
+    """Construit l'unique stratégie utilisée par tout le pipeline."""
+    mode = mode or "train_minmax"
+    if mode == "train_minmax":
+        return TrainMinMaxNormalizer()
+    if mode == "window_local":
+        return WindowLocalNormalizer()
+    if mode != "nominal":
+        raise ValueError("normalization_mode doit valoir train_minmax, nominal ou window_local")
+    configured = nominal_normalization or {}
+
+    def parameters(physical_name):
+        candidates = [key for key in configured if physical_name.upper().endswith(str(key).upper())]
+        if len(candidates) != 1:
+            raise ValueError(f"Paramètres nominaux manquants ou ambigus pour {physical_name!r}")
+        value = configured[candidates[0]]
+        return float(value["center"]), float(value["scale"])
+
+    center = np.zeros(representation.model_dim, dtype=np.float32)
+    scale = np.ones(representation.model_dim, dtype=np.float32)
+    for feature in representation.direct_features:
+        center[feature.model_index], scale[feature.model_index] = parameters(feature.physical_name)
+    for phasor in representation.phasors:
+        if phasor.includes_amplitude:
+            center[phasor.model_amplitude_index], scale[phasor.model_amplitude_index] = parameters(
+                phasor.amplitude_name
+            )
+        # cos/sin restent intentionnellement centrés sur 0 et à l'échelle 1.
+    return NominalNormalizer(center, scale)
+
+
 def validate_checkpoint_model_dimension(
     checkpoint: dict,
     expected_dim: int,
@@ -395,6 +570,7 @@ def notre_data_tri(
     data_file_path,
     exclude_zero_sequence_phase: bool = False,
     data_column_order=None,
+    excluded_features=None,
 ):
     df = pd.read_csv(data_file_path, sep=";")
 
@@ -419,9 +595,24 @@ def notre_data_tri(
     selected_columns = resolve_data_column_order(df.columns, data_column_order)
     df = df.loc[:, selected_columns]
 
+    configured_excluded = {str(name).upper() for name in (excluded_features or ())}
+    configured_names = {str(name).upper() for name in data_column_order}
+    unknown_excluded = configured_excluded - configured_names
+    if unknown_excluded:
+        raise ValueError(
+            "excluded_features contient des noms absents de data_column_order: "
+            f"{sorted(unknown_excluded)}"
+        )
+    resolved_excluded = [
+        actual
+        for configured_name, actual in zip(data_column_order, selected_columns)
+        if str(configured_name).upper() in configured_excluded
+    ]
+
     representation = build_feature_representation(
         df.columns,
         exclude_zero_sequence_phase=exclude_zero_sequence_phase,
+        excluded_features=resolved_excluded,
     )
     data = df.to_numpy(dtype=np.float64)
 
@@ -442,12 +633,14 @@ def get_data_simple(
     data_file_path,
     exclude_zero_sequence_phase: bool = False,
     data_column_order=None,
+    excluded_features=None,
 ):
     """Charge un CSV PMU avec exactement la même représentation que get_data."""
     return notre_data_tri(
         data_file_path,
         exclude_zero_sequence_phase,
         data_column_order,
+        excluded_features,
     )
 
 
@@ -564,7 +757,8 @@ def get_data(
         train_start: int = 0,
         return_metadata: bool = False,
         exclude_zero_sequence_phase: bool = False,
-        data_column_order=None,
+    data_column_order=None,
+    excluded_features=None,
 ):
     """
     Charge les données d'entraînement et de test.
@@ -601,6 +795,7 @@ def get_data(
         data_directory,
         exclude_zero_sequence_phase=exclude_zero_sequence_phase,
         data_column_order=data_column_order,
+        excluded_features=excluded_features,
     )
 
     physical_dim = get_data_dim(dataset)

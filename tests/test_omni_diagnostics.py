@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 from copy import deepcopy
+import inspect
 
 import pytest
 import torch
@@ -11,6 +12,12 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "omnis"))
 from model import OmniAnomaly
 from units import DistributionParameterNetwork
 from trainer import SigmaEpochStatistics, Trainer
+
+
+def test_trainer_accepts_normalizer_but_sigma_statistics_does_not():
+    """Protège contre l'ajout accidentel de l'argument au mauvais constructeur."""
+    assert "normalizer" in inspect.signature(Trainer).parameters
+    assert "normalizer" not in inspect.signature(SigmaEpochStatistics).parameters
 
 
 class IdentityHidden(torch.nn.Module):
