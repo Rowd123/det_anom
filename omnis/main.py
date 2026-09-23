@@ -275,7 +275,7 @@ def main(config) -> None:
             )
         checkpoint_path = Path(config.restore_checkpoint)
 
-        trainer.load_checkpoint(checkpoint_path)
+        trainer.load_checkpoint(checkpoint_path, learning_rate=confg.initial_lr)
 
         print(
             f"Modèle restauré depuis {checkpoint_path}"
