@@ -748,7 +748,7 @@ class Trainer:
             path,
         )
 
-    def load_checkpoint(self, path: str | Path) -> None:
+    def load_checkpoint(self, path: str | Path, learning_rate: float | None = None) -> None:
         checkpoint = torch.load(
             path,
             map_location=self._device,
@@ -770,11 +770,29 @@ class Trainer:
 
         self._model.load_state_dict(checkpoint["model_state_dict"])
         self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        if learning_rate is not None:
+            for param_group in self._optimizer.param_groups:
+                param_group["lr"] = learning_rate
+    
         if (
             self._scheduler is not None
             and checkpoint["scheduler_state_dict"] is not None
         ):
-            self._scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self._scheduler.load_state_dict(
+                checkpoint["scheduler_state_dict"]
+            )
+    
+            if learning_rate is not None:
+                self._scheduler.base_lrs = [
+                    learning_rate
+                    for _ in self._optimizer.param_groups
+                ]
+                self._scheduler._last_lr = [
+                    group["lr"]
+                    for group in self._optimizer.param_groups
+                ]
+        
         self._global_step = checkpoint["global_step"]
         self._epoch = checkpoint.get("epoch", 0)
         normalizer_state = checkpoint.get(
