@@ -704,7 +704,7 @@ class Trainer:
 
         if best_model_state is not None:
             if checkpoint_path is not None and Path(checkpoint_path).is_file():
-                self.load_checkpoint(checkpoint_path)
+                self.load_checkpoint(checkpoint_path, learning_rate=config.initial_lr)
             else:
                 self._model.load_state_dict(best_model_state)
 
