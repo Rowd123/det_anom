@@ -29,14 +29,14 @@ def test_scores_match_predictor_and_top_windows_keep_original_indices(per_dim):
     excludes[8] = True
     normalizer = TrainMinMaxNormalizer().fit(values)
     torch.manual_seed(15)
-    expected, _, _ = Predictor(model, n_z=2, batch_size=3, device='cpu',
+    expected, _, _ = Predictor(model, n_z=2, batch_size=3, device='cpu', last_point_only=False,
                                normalizer=normalizer).get_score(values, excludes)
     if per_dim:
         expected = expected.sum(axis=-1)
     torch.manual_seed(15)
     scores, ends, retained = score_windows(model, normalizer, values, excludes,
                                            3, 2, torch.device('cpu'), retain=3)
-    np.testing.assert_allclose(scores, -expected, rtol=1e-6)
+    np.testing.assert_allclose(scores, -expected.mean(axis=-1), rtol=1e-6)
     assert not set(ends) & {8, 9, 10, 11}
     assert set(retained) == set(ends[np.argsort(-scores, kind='stable')[:3]])
     for end, (observed, reconstructed) in retained.items():
@@ -47,8 +47,8 @@ def test_scores_match_predictor_and_top_windows_keep_original_indices(per_dim):
 def test_score_and_reconstruction_share_the_same_latents():
     model = OmniAnomaly(config()).eval()
     values = torch.randn(2, 4, 2)
-    score, _, reconstruction = model.get_score(values, n_z=1, return_reconstruction=True)
-    expected = torch.distributions.Normal(reconstruction, .05).log_prob(values).sum(-1)[:, -1]
+    score, _, reconstruction = model.get_score(values, n_z=1, last_point_only=False, return_reconstruction=True)
+    expected = torch.distributions.Normal(reconstruction, .05).log_prob(values).sum(-1)
     torch.testing.assert_close(score, expected)
 
 
@@ -128,7 +128,9 @@ def test_checkpoint_to_spot_export_end_to_end(tmp_path, stride):
     scores = np.load(tmp_path/"out/chronological_scores.npz")
     np.testing.assert_array_equal(scores["window_end"], np.arange(3, 100, effective_stride))
     import json
-    assert json.loads((tmp_path/"out/analysis.json").read_text())["stride"] == effective_stride
+    metadata = json.loads((tmp_path/"out/analysis.json").read_text())
+    assert metadata["stride"] == effective_stride
+    assert metadata["score_aggregation"] == "window_mean"
     assert sum(bool(r['figure_file']) for r in rows) == 1
     assert (tmp_path/'out/index.html').is_file()
     assert before == (tmp_path/'model.pt').read_bytes()
@@ -144,7 +146,8 @@ def test_stride_filters_before_inference_and_keeps_grid_with_exclusions(stride):
             self.processed = 0
         def get_score(self, windows, **kwargs):
             self.processed += len(windows)
-            return -windows[:, -1].sum(-1), None, windows
+            assert kwargs["last_point_only"] is False
+            return -windows.sum(-1), None, windows
 
     model = CountingModel()
     values = torch.arange(38, dtype=torch.float32).reshape(19, 2)
@@ -167,3 +170,25 @@ def test_invalid_window_stride_is_rejected(stride):
     from utils import BatchSlidingWindow
     with pytest.raises(ValueError, match='stride'):
         BatchSlidingWindow(20, 4, 2, stride=stride)
+
+
+
+@pytest.mark.parametrize('per_dim', [False, True])
+def test_full_window_score_includes_interior_event_with_normal_last_point(per_dim):
+    class FixedGaussianModel(torch.nn.Module):
+        window_length = 4
+        def get_score(self, windows, **kwargs):
+            assert kwargs['last_point_only'] is False
+            logp = torch.distributions.Normal(0., 1.).log_prob(windows)
+            return (logp if per_dim else logp.sum(-1)), None, torch.zeros_like(windows)
+
+    from utils import NominalNormalizer
+    values = torch.zeros(8, 2)
+    values[1, 0] = 4.  # event strictly inside first window; both last points zero
+    scores, ends, _ = score_windows(FixedGaussianModel(),
+        NominalNormalizer([0., 0.], [1., 1.]), values, None,
+        2, 1, torch.device('cpu'), stride=4)
+    reference = -torch.distributions.Normal(0., 1.).log_prob(values.reshape(2, 4, 2)).sum(-1).mean(-1)
+    np.testing.assert_allclose(scores, reference.numpy())
+    np.testing.assert_array_equal(ends, [3, 7])
+    assert scores[0] - scores[1] == pytest.approx(2.)

@@ -30,15 +30,28 @@ La calibration utilise les fenêtres valides de `train` sélectionnées par le p
 normal. Les masques d'exclusion et la représentation physique du dépôt sont
 réutilisés. Le normaliseur est restauré depuis le checkpoint sans réajustement.
 
-Le score envoyé à SPOT est exactement l'opposé de celui du `Predictor` existant,
-avec somme sur les caractéristiques si `get_score_on_dim` est activé :
+Le modèle est appelé avec `last_point_only=False`. Le score envoyé à SPOT
+est calculé sur **toute la fenêtre** :
 
-    score = -mean_z sum_features log p(x_last | z)
+    score = -mean_time mean_z sum_features log p(x_t | z)
 
-C'est le score du **dernier point** de la fenêtre causale, pas une moyenne de
-scores sur la fenêtre et pas une probabilité d'anomalie. La reconstruction
-complète représente la moyenne des moyennes du décodeur pour les mêmes tirages
-latents que ceux utilisés pour ce score.
+La somme porte sur les caractéristiques, la moyenne sur les échantillons latents
+et sur tous les instants de la fenêtre. Si `get_score_on_dim` est activé,
+le script effectue la somme des caractéristiques ; sinon le modèle la fournit.
+Ce n'est pas une probabilité d'anomalie. Une perturbation intérieure contribue au
+score même si le dernier point est normal ; un événement très bref peut toutefois
+être atténué par la moyenne temporelle.
+
+La reconstruction complète représente la moyenne des moyennes du décodeur pour
+les mêmes tirages latents que ceux utilisés pour ce score. La calibration train,
+l'analyse test et le classement utilisent tous cette définition. Les poids du
+modèle et la normalisation sauvegardée restent inchangés. Les autres scripts
+conservent leur convention de score existante.
+
+Relancer la commande pour recalculer les scores et la calibration SPOT : les
+anciens scores/seuils au dernier point ne sont pas réutilisables. Utiliser un
+nouveau répertoire `--output` pour séparer les anciens et nouveaux exports.
+`analysis.json` indique `score_aggregation: window_mean`.
 
 SPOT fournit un seuil dynamique et une décision. Il n'existe pas ici de score
 probabiliste SPOT distinct. `score` désigne le score OmniAnomaly fourni à SPOT ;
@@ -79,8 +92,8 @@ PyYAML, tqdm, matplotlib). Les exports SVG ne nécessitent pas Kaleido.
 
 Par défaut, le pas vaut maintenant `window_length` : avec 100 points par fenêtre,
 les fenêtres sont 0–99, 100–199, 200–299, etc. Elles ne se recouvrent pas.
-`--stride 50` avance de 50 échantillons ; `--stride 1` retrouve le comportement
-historique. Le même pas est appliqué à train (calibration) et test, **avant**
+`--stride 50` avance de 50 échantillons ; `--stride 1` retrouve le pas
+historique, avec le nouveau score sur toute la fenêtre. Le même pas est appliqué à train (calibration) et test, **avant**
 l'inférence : les fenêtres intermédiaires ne sont pas calculées.
 
 Chaque partie commence sa propre grille à son premier point. Une fenêtre avec un
@@ -89,9 +102,9 @@ forment pas une fenêtre complète sont ignorés. Le pas effectif est enregistr�
 dans `analysis.json`. L'entraînement et les autres scripts conservent leur pas
 historique de 1 ; la longueur des fenêtres du modèle reste inchangée.
 
-Le score reste celui du dernier point : avec 100 points par fenêtre et un pas de
-100, les décisions concernent les points 99, 199, 299… Une anomalie intermédiaire
-peut donc être manquée. Le modèle reconstruit toujours la fenêtre entière.
+Avec 100 points par fenêtre et un pas de 100, chaque décision porte sur les
+100 points de la fenêtre correspondante. Le modèle reconstruit la fenêtre entière.
 SPOT reçoit moins de scores de calibration : si le nombre d'excès est insuffisant,
 augmenter la durée de calibration ou réduire `--stride`. Le script refuse de
 fabriquer un seuil avec une calibration insuffisante.
+

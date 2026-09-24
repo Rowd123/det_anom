@@ -50,7 +50,10 @@ def apply_spot(calibration, scores, q=0.001, level=0.98):
 @torch.inference_mode()
 def score_windows(model, normalizer, values, excludes, batch_size, n_z, device,
                   retain=0, stride=1):
-    """Retain only top-k reconstructions (all if retain=None, none if 0)."""
+    """Score the full window: negative mean over time/z, sum over features.
+
+    Retain only top-k reconstructions (all if retain=None, none if 0).
+    """
     values = torch.as_tensor(values, dtype=torch.float32)
     iterator = BatchSlidingWindow(
         len(values), model.window_length, batch_size=batch_size,
@@ -62,11 +65,15 @@ def score_windows(model, normalizer, values, excludes, batch_size, n_z, device,
     for windows, indices in iterator:
         normalized, context = normalizer.transform(windows.to(device))
         log_prob, _, reconstruction = model.get_score(
-            normalized, n_z=n_z, last_point_only=True, return_reconstruction=True,
+            normalized, n_z=n_z, last_point_only=False, return_reconstruction=True,
         )
-        if log_prob.ndim == 2:
+        # get_score already averages posterior samples. Its output is [B,L,D]
+        # with per-feature scores, otherwise [B,L] (features already summed).
+        if log_prob.ndim == 3:
             log_prob = log_prob.sum(dim=-1)
-        scores = -log_prob.cpu().numpy()
+        if log_prob.shape != normalized.shape[:2]:
+            raise ValueError('Les log-vraisemblances doivent couvrir tous les points de chaque fenêtre')
+        scores = -log_prob.mean(dim=-1).cpu().numpy()
         if not np.isfinite(scores).all():
             raise ValueError("Score OmniAnomaly non fini")
         ends = indices[:, -1].numpy()
@@ -152,7 +159,8 @@ def export_results(output, scores, ends, thresholds, alarms, retained,
         '<!doctype html><meta charset="utf-8"><title>OmniAnomaly + SPOT</title>'
         '<h1>Windows ranked by decreasing OmniAnomaly score</h1>'
         '<p>SPOT was applied in chronological order. Score = negative reconstruction '
-        'log-likelihood at the last point of each window; it is not a probability.</p>'
+        'log-likelihood averaged over the full window, summed over features; '
+        'it is not a probability.</p>'
         '<a href="ranked_windows.csv">All ranked scores (CSV)</a><ol>'
         + ''.join(links) + '</ol>', encoding='utf-8')
 
@@ -183,7 +191,7 @@ def main(args):
     )
     stride = model.window_length if requested_stride is None else requested_stride
     print(f'Longueur des fenêtres : {model.window_length}; pas : {stride} échantillons '
-          '(calibration et test). Score calculé au dernier point de chaque fenêtre.')
+          '(calibration et test). Score moyen sur toute la fenêtre, somme sur les caractéristiques.')
     common = dict(model=model, normalizer=normalizer, batch_size=args.batch_size,
                   n_z=args.n_z, device=device, stride=stride)
     calibration, calibration_ends, _ = score_windows(
@@ -200,7 +208,8 @@ def main(args):
                         score=calibration, window_end=calibration_ends)
     metadata = dict(vars(args), config_path=str(path), configuration=vars(config),
                     feature_names=representation.model_names,
-                    score_definition='negative mean-over-z log-likelihood, sum over features, last point',
+                    score_definition='negative mean-over-z and time log-likelihood, sum over features',
+                    score_aggregation='window_mean',
                     ranking='score descending; ties chronological',
                     calibration_windows=len(calibration), test_windows=len(scores),
                     anomalies=int(alarms.sum()))
