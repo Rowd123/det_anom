@@ -204,7 +204,9 @@ def test_correct_ang_mag_semantics_and_scaling_round_trip():
     second = physical.copy()
     second[0, [5, 11]] = [1100.0, 250000.0]
     second[0, [4, 10]] = [35.0, -40.0]
-    scaler = MinMaxScaler().fit(np.concatenate((physical, second)))
+    scaler = MinMaxScaler().fit(
+        phasor_to_phase_embedding(np.concatenate((physical, second)), mapping)
+    )
     scaled = scaler.transform(embedded)
     unscaled = scaler.inverse_transform(scaled)
     restored = phase_embedding_to_phasor(unscaled, mapping).numpy()
@@ -253,3 +255,59 @@ def test_semantically_old_checkpoint_is_rejected_even_with_same_dimension():
             mapping.model_names,
             FEATURE_REPRESENTATION_VERSION,
         )
+
+
+
+def test_colon_suffix_generates_same_names_and_values_as_underscore():
+    colon = ['vigy_1:dfdt', 'vigy_1:freq', 'vigy_1:ia_i0:ANG', 'vigy_1:ia_i0:MAG']
+    underscore = [name.replace(':ANG', '_ANG').replace(':MAG', '_MAG') for name in colon]
+    a = build_feature_representation(colon)
+    b = build_feature_representation(underscore)
+    assert a.model_names == b.model_names
+    values = np.array([[1., 50., 90., 3.], [2., 49., -179., 4.]])
+    np.testing.assert_array_equal(phasor_to_phase_embedding(values, a), phasor_to_phase_embedding(values, b))
+
+
+def _reported_feature_names():
+    return ('vigy_1:dfdt', 'vigy_1:freq') + tuple(
+        f'vigy_1:{stem}_{suffix}'
+        for stem in ('ia_i0', 'ia_i1', 'ia_i2', 'va_v0', 'va_v1', 'va_v2')
+        for suffix in (('mag', 'phase_cos', 'phase_sin') if stem == 'va_v1'
+                       else ('phase_cos', 'phase_sin'))
+    )
+
+
+def _feature_checkpoint(names, version=FEATURE_REPRESENTATION_VERSION):
+    return dict(model_feature_names=names, model_x_dim=len(names), feature_representation=version)
+
+
+def test_reported_15_feature_checkpoint_accepts_only_separator_alias_without_mutation():
+    import pytest
+    import re
+    expected = _reported_feature_names()
+    old = tuple(re.sub(r'_(mag|phase_cos|phase_sin)$', r':_\1', n) for n in expected)
+    checkpoint = _feature_checkpoint(old)
+    with pytest.warns(UserWarning, match='Compatibilité de nommage'):
+        validate_checkpoint_model_dimension(checkpoint, 15, expected, FEATURE_REPRESENTATION_VERSION)
+    assert checkpoint['model_feature_names'] == old
+
+
+def test_separator_alias_does_not_accept_wrong_order_station_quantity_or_version():
+    expected = _reported_feature_names()
+    variants = [
+        (expected[1], expected[0], *expected[2:]),
+        ('other:dfdt', *expected[1:]),
+        ('vigy_1:vigy_1:dfdt', *expected[1:]),
+        (*expected[:-1], 'vigy_1:va_v2_mag'),
+    ]
+    for wrong in variants:
+        with np.testing.assert_raises_regex(ValueError, 'features modèle diffèrent'):
+            validate_checkpoint_model_dimension(_feature_checkpoint(wrong), 15, expected, FEATURE_REPRESENTATION_VERSION)
+    with np.testing.assert_raises_regex(ValueError, 'sémantique ANG/MAG'):
+        validate_checkpoint_model_dimension(_feature_checkpoint(expected, 'old'), 15, expected, FEATURE_REPRESENTATION_VERSION)
+
+
+def test_separator_alias_rejects_ambiguous_features():
+    names = ('vigy_1:ia_i0:_mag', 'vigy_1:ia_i0_mag')
+    with np.testing.assert_raises_regex(ValueError, 'ambigus'):
+        validate_checkpoint_model_dimension(_feature_checkpoint(names), 2, names)

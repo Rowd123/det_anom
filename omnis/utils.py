@@ -5,6 +5,7 @@ from torch import Tensor
 
 import pickle
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -80,14 +81,14 @@ def _readable_feature_name(name: str) -> str:
 def _phasor_name(amplitude_name: str, phase_name: str) -> str:
     """Produit un nom lisible sans utiliser les noms pour décider des couples."""
     if amplitude_name.endswith("MAG"):
-        return amplitude_name[:-len("MAG")].rstrip(" _.-")
+        return amplitude_name[:-len("MAG")].rstrip(" _:.-")
 
     common_length = 0
     for amplitude_character, phase_character in zip(amplitude_name, phase_name):
         if amplitude_character != phase_character:
             break
         common_length += 1
-    common_name = amplitude_name[:common_length].rstrip(" _.-")
+    common_name = amplitude_name[:common_length].rstrip(" _:.-")
     return common_name or amplitude_name
 
 
@@ -502,6 +503,15 @@ def build_normalizer(mode, representation, nominal_normalization=None):
     return NominalNormalizer(center, scale)
 
 
+def _checkpoint_feature_alias(name: str) -> str:
+    """Only accept the historical colon before a generated phasor suffix.
+
+    Preserve station prefixes, channel identity, case and feature ordering.
+    This is a naming alias, not a representation or checkpoint migration.
+    """
+    return re.sub(r"(?<!:):_(mag|phase_cos|phase_sin)$", r"_\1", name)
+
+
 def validate_checkpoint_model_dimension(
     checkpoint: dict,
     expected_dim: int,
@@ -521,12 +531,25 @@ def validate_checkpoint_model_dimension(
             "Conservez ce checkpoint séparément et relancez en mode scratch."
         )
     saved_feature_names = checkpoint.get("model_feature_names")
-    if (
-        saved_feature_names is not None
-        and expected_feature_names is not None
-        and tuple(saved_feature_names) != tuple(expected_feature_names)
-    ):
-        raise ValueError("Checkpoint incompatible : les features modèle diffèrent")
+    used_alias = False
+    if saved_feature_names is not None and expected_feature_names is not None:
+        saved_names = tuple(saved_feature_names)
+        expected_names = tuple(expected_feature_names)
+        canonical_saved = tuple(map(_checkpoint_feature_alias, saved_names))
+        canonical_expected = tuple(map(_checkpoint_feature_alias, expected_names))
+        for names in (canonical_saved, canonical_expected):
+            if len(set(names)) != len(names):
+                raise ValueError("Checkpoint incompatible : noms de features ambigus après normalisation des séparateurs")
+        if len(saved_names) != expected_dim or len(expected_names) != expected_dim:
+            raise ValueError("Checkpoint incompatible : nombre de noms de features différent de la dimension modèle")
+        if canonical_saved != canonical_expected:
+            mismatches = [
+                f"[{i}] checkpoint={saved!r}, données={expected!r}"
+                for i, (saved, expected) in enumerate(zip(saved_names, expected_names))
+                if canonical_saved[i] != canonical_expected[i]
+            ]
+            raise ValueError("Checkpoint incompatible : les features modèle diffèrent : " + "; ".join(mismatches[:5]))
+        used_alias = saved_names != expected_names
     saved_version = checkpoint.get("feature_representation")
     if (
         expected_representation_version is not None
@@ -536,6 +559,14 @@ def validate_checkpoint_model_dimension(
             "Checkpoint incompatible : la sémantique ANG/MAG a changé "
             f"({saved_version!r} reçu, {expected_representation_version!r} attendu). "
             "Relancez l'entraînement depuis scratch."
+        )
+    if used_alias:
+        warnings.warn(
+            "Compatibilité de nommage appliquée : ':_mag/:_phase_cos/:_phase_sin' "
+            "équivaut à '_mag/_phase_cos/_phase_sin'. Ordre des features conservé; "
+            "checkpoint inchangé.",
+            UserWarning,
+            stacklevel=2,
         )
 
 
