@@ -218,6 +218,7 @@ class OmniAnomaly(nn.Module):
         x: Tensor,
         n_z: int = 1,
         last_point_only: bool = True,
+        return_reconstruction: bool = False,
     ) -> tuple[Tensor, Tensor]:
         """
         Retourne :
@@ -276,4 +277,7 @@ class OmniAnomaly(nn.Module):
                 reconstruction_log_prob[:, -1]
             )
 
+        if return_reconstruction:
+            # Same posterior samples for the score and the displayed window.
+            return reconstruction_log_prob, z_statistics, x_parameters["loc"].mean(dim=0)
         return reconstruction_log_prob, z_statistics

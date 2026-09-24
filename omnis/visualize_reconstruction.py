@@ -49,7 +49,7 @@ def physical_reconstruction_indices(representation):
             indices.append(phasor.physical_amplitude_index)
         if phasor.includes_phase:
             indices.append(phasor.physical_phase_index)
-    return indices
+    return sorted(indices)
 
 
 @torch.inference_mode()
@@ -192,6 +192,43 @@ def plot_plotly(x, observed, reconstructed, names, mse, output_path):
     figure.write_html(output_path, include_plotlyjs=True)
 
 
+def load_trained_model(config, representation, checkpoint_path, device_name=None):
+    """Restore model and preprocessing without fitting or training."""
+    config.x_dim = representation.model_dim
+    config.normalization_mode = getattr(config, "normalization_mode", "train_minmax")
+    normalizer = build_normalizer(
+        config.normalization_mode,
+        representation,
+        getattr(config, "nominal_normalization", None),
+    )
+
+    device = torch.device(
+        device_name
+        if device_name is not None
+        else "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    validate_checkpoint_model_dimension(
+        state,
+        config.x_dim,
+        expected_feature_names=representation.model_names,
+        expected_representation_version=FEATURE_REPRESENTATION_VERSION,
+    )
+    saved_mode = state.get("normalization_mode", "train_minmax")
+    if saved_mode != normalizer.mode:
+        raise ValueError(
+            f"Checkpoint incompatible : normalization_mode={saved_mode!r}, "
+            f"configuration courante={normalizer.mode!r}"
+        )
+    model = OmniAnomaly(config).to(device)
+    model.load_state_dict(state["model_state_dict"])
+    normalizer.load_checkpoint_state(
+        state.get("normalizer_state_dict", state.get("scaler_state_dict", {}))
+    )
+    model.eval()
+    return model, normalizer, device
+
+
 def main(arguments):
     config_path = Path(arguments.config).resolve()
     config = load_config(config_path)
@@ -226,37 +263,8 @@ def main(arguments):
     values, _, excludes = train if split == "train" else test
     if values is None:
         raise ValueError(f"La partie {split} est vide")
-    config.x_dim = representation.model_dim
-    config.normalization_mode = getattr(config, "normalization_mode", "train_minmax")
-    normalizer = build_normalizer(
-        config.normalization_mode,
-        representation,
-        getattr(config, "nominal_normalization", None),
-    )
-
-    checkpoint_path = resolve_from_config(checkpoint, config_path)
-    device = torch.device(
-        device_name
-        if device_name is not None
-        else "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    validate_checkpoint_model_dimension(
-        state,
-        config.x_dim,
-        expected_feature_names=representation.model_names,
-        expected_representation_version=FEATURE_REPRESENTATION_VERSION,
-    )
-    saved_mode = state.get("normalization_mode", "train_minmax")
-    if saved_mode != normalizer.mode:
-        raise ValueError(
-            f"Checkpoint incompatible : normalization_mode={saved_mode!r}, "
-            f"configuration courante={normalizer.mode!r}"
-        )
-    model = OmniAnomaly(config).to(device)
-    model.load_state_dict(state["model_state_dict"])
-    normalizer.load_checkpoint_state(
-        state.get("normalizer_state_dict", state.get("scaler_state_dict", {}))
+    model, normalizer, device = load_trained_model(
+        config, representation, resolve_from_config(checkpoint, config_path), device_name
     )
     values = torch.as_tensor(values, dtype=torch.float32)
     indices, reconstructed_embedding = reconstruct_last_points(
