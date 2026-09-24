@@ -88,7 +88,8 @@ def test_ranked_export_has_full_physical_windows_and_scores(tmp_path):
     assert (tmp_path / rows[0]['figure_file']).read_text().find('<svg') >= 0
 
 
-def test_checkpoint_to_spot_export_end_to_end(tmp_path):
+@pytest.mark.parametrize("stride", [None, 1, 2])
+def test_checkpoint_to_spot_export_end_to_end(tmp_path, stride):
     import pandas as pd
     import yaml
     from analyze_spot import main
@@ -117,10 +118,52 @@ def test_checkpoint_to_spot_export_end_to_end(tmp_path):
     torch.save(checkpoint, tmp_path/'model.pt')
     before = (tmp_path/'model.pt').read_bytes()
     main(SimpleNamespace(config=str(tmp_path/'config.yaml'), checkpoint=str(tmp_path/'model.pt'),
-         output=str(tmp_path/'out'), top=1, batch_size=32, n_z=2, q=.001, level=.95,
+         output=str(tmp_path/'out'), top=1, batch_size=32, n_z=2, q=.001, level=.90, stride=stride,
          seed=42, device='cpu'))
     rows = list(csv.DictReader((tmp_path/'out/ranked_windows.csv').open()))
-    assert len(rows) == 97
+    effective_stride = stride or 4
+    assert len(rows) == len(range(3, 100, effective_stride))
+    calibration = np.load(tmp_path/"out/calibration_scores.npz")
+    np.testing.assert_array_equal(calibration["window_end"], np.arange(3, 400, effective_stride))
+    scores = np.load(tmp_path/"out/chronological_scores.npz")
+    np.testing.assert_array_equal(scores["window_end"], np.arange(3, 100, effective_stride))
+    import json
+    assert json.loads((tmp_path/"out/analysis.json").read_text())["stride"] == effective_stride
     assert sum(bool(r['figure_file']) for r in rows) == 1
     assert (tmp_path/'out/index.html').is_file()
     assert before == (tmp_path/'model.pt').read_bytes()
+
+
+
+@pytest.mark.parametrize('stride', [1, 2, 4, 6])
+def test_stride_filters_before_inference_and_keeps_grid_with_exclusions(stride):
+    class CountingModel(torch.nn.Module):
+        window_length = 4
+        def __init__(self):
+            super().__init__()
+            self.processed = 0
+        def get_score(self, windows, **kwargs):
+            self.processed += len(windows)
+            return -windows[:, -1].sum(-1), None, windows
+
+    model = CountingModel()
+    values = torch.arange(38, dtype=torch.float32).reshape(19, 2)
+    excluded = np.zeros(19, dtype=bool)
+    excluded[5] = True
+    normalizer = TrainMinMaxNormalizer().fit(values)
+    scores, ends, retained = score_windows(model, normalizer, values, excluded,
+        3, 1, torch.device('cpu'), retain=None, stride=stride)
+    expected = [end for end in range(3, 19, stride) if not end-3 <= 5 <= end]
+    np.testing.assert_array_equal(ends, expected)
+    assert model.processed == len(expected)
+    assert len(scores) == len(expected)
+    for end, (observed, reconstructed) in retained.items():
+        torch.testing.assert_close(observed, values[end-3:end+1])
+        torch.testing.assert_close(reconstructed, observed)
+
+
+@pytest.mark.parametrize('stride', [0, -1, 1.5, True])
+def test_invalid_window_stride_is_rejected(stride):
+    from utils import BatchSlidingWindow
+    with pytest.raises(ValueError, match='stride'):
+        BatchSlidingWindow(20, 4, 2, stride=stride)

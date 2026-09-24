@@ -1139,6 +1139,7 @@ class BatchSlidingWindow:
             excludes: Tensor | None = None,
             shuffle: bool = False,
             ignore_incomplete_batch: bool = False,
+            stride: int = 1,
     ):
         if window_size < 1:
             raise ValueError(
@@ -1155,10 +1156,14 @@ class BatchSlidingWindow:
                 "batch_size doit être supérieur ou égal à 1"
             )
 
-        # Les indices possibles représentent les fins des fenêtres.
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+            raise ValueError("stride doit être un entier supérieur ou égal à 1")
+
+        # Fixer la grille avant les exclusions pour préserver les indices.
         window_end_indices = torch.arange(
             window_size - 1,
             array_size,
+            step=stride,
             dtype=torch.long,
         )
 
@@ -1179,7 +1184,7 @@ class BatchSlidingWindow:
             exclusion_windows = excludes.unfold(
                 dimension=0,
                 size=window_size,
-                step=1,
+                step=stride,
             )
 
             # Une fenêtre est valide si aucun de ses points n'est exclu.

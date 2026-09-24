@@ -14,7 +14,7 @@ python omnis/analyze_spot.py \
 
 Remplacer `TON_MODELE.pt` par le checkpoint réel. `--top 0` exporte toutes les
 fenêtres ; cela peut générer beaucoup de SVG/NPZ. Toutes les fenêtres valides du
-test sont scorées et incluses dans le CSV, quelle que soit la valeur de `--top`.
+test sélectionnées par le pas sont scorées et incluses dans le CSV, quelle que soit la valeur de `--top`.
 `--device cpu` force le CPU. `--seed 42` fixe la graine ; conserver aussi le même
 batch-size et n-z pour reproduire les tirages Monte-Carlo.
 
@@ -25,7 +25,7 @@ etc.) ne déclenchent jamais d'entraînement dans cette commande.
 
 ## Score et SPOT
 
-La calibration utilise les fenêtres valides de `train` ; le flux analysé est
+La calibration utilise les fenêtres valides de `train` sélectionnées par le pas ; le flux analysé est
 `test`, dans l'ordre chronologique. Choisir un train représentatif du régime
 normal. Les masques d'exclusion et la représentation physique du dépôt sont
 réutilisés. Le normaliseur est restauré depuis le checkpoint sans réajustement.
@@ -73,3 +73,25 @@ Les reconstructions conservées en mémoire sont limitées au top demandé ; le
 calcul des scores garde le fonctionnement par mini-batch. Aucun checkpoint n'est
 modifié. Dépendances : celles du projet (PyTorch, pyro-ppl, NumPy, pandas, SciPy,
 PyYAML, tqdm, matplotlib). Les exports SVG ne nécessitent pas Kaleido.
+
+
+## Fenêtres espacées pour accélérer l'analyse
+
+Par défaut, le pas vaut maintenant `window_length` : avec 100 points par fenêtre,
+les fenêtres sont 0–99, 100–199, 200–299, etc. Elles ne se recouvrent pas.
+`--stride 50` avance de 50 échantillons ; `--stride 1` retrouve le comportement
+historique. Le même pas est appliqué à train (calibration) et test, **avant**
+l'inférence : les fenêtres intermédiaires ne sont pas calculées.
+
+Chaque partie commence sa propre grille à son premier point. Une fenêtre avec un
+point exclu est ignorée sans décaler cette grille. Les derniers points qui ne
+forment pas une fenêtre complète sont ignorés. Le pas effectif est enregistré
+dans `analysis.json`. L'entraînement et les autres scripts conservent leur pas
+historique de 1 ; la longueur des fenêtres du modèle reste inchangée.
+
+Le score reste celui du dernier point : avec 100 points par fenêtre et un pas de
+100, les décisions concernent les points 99, 199, 299… Une anomalie intermédiaire
+peut donc être manquée. Le modèle reconstruit toujours la fenêtre entière.
+SPOT reçoit moins de scores de calibration : si le nombre d'excès est insuffisant,
+augmenter la durée de calibration ou réduire `--stride`. Le script refuse de
+fabriquer un seuil avec une calibration insuffisante.

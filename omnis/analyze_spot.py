@@ -49,12 +49,13 @@ def apply_spot(calibration, scores, q=0.001, level=0.98):
 
 @torch.inference_mode()
 def score_windows(model, normalizer, values, excludes, batch_size, n_z, device,
-                  retain=0):
+                  retain=0, stride=1):
     """Retain only top-k reconstructions (all if retain=None, none if 0)."""
     values = torch.as_tensor(values, dtype=torch.float32)
     iterator = BatchSlidingWindow(
         len(values), model.window_length, batch_size=batch_size,
         excludes=excludes, shuffle=False, ignore_incomplete_batch=False,
+        stride=stride,
     ).get_iterator([values, torch.arange(len(values))])
     all_scores, all_ends, retained = [], [], []
     model.eval()
@@ -157,6 +158,9 @@ def export_results(output, scores, ends, thresholds, alarms, retained,
 
 
 def main(args):
+    requested_stride = getattr(args, 'stride', None)
+    if requested_stride is not None and requested_stride < 1:
+        raise ValueError('stride doit être supérieur ou égal à 1')
     if args.top < 0 or args.batch_size < 1 or args.n_z < 1:
         raise ValueError('top >= 0, batch-size >= 1 et n-z >= 1 requis')
     torch.manual_seed(args.seed)
@@ -177,8 +181,11 @@ def main(args):
     model, normalizer, device = load_trained_model(
         config, representation, Path(args.checkpoint).resolve(), args.device,
     )
+    stride = model.window_length if requested_stride is None else requested_stride
+    print(f'Longueur des fenêtres : {model.window_length}; pas : {stride} échantillons '
+          '(calibration et test). Score calculé au dernier point de chaque fenêtre.')
     common = dict(model=model, normalizer=normalizer, batch_size=args.batch_size,
-                  n_z=args.n_z, device=device)
+                  n_z=args.n_z, device=device, stride=stride)
     calibration, calibration_ends, _ = score_windows(
         values=train[0], excludes=train[2], **common,
     )
@@ -197,6 +204,7 @@ def main(args):
                     ranking='score descending; ties chronological',
                     calibration_windows=len(calibration), test_windows=len(scores),
                     anomalies=int(alarms.sum()))
+    metadata['stride'] = stride
     (output / 'analysis.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print(f'{len(scores)} fenêtres, {alarms.sum()} anomalies. Résultats : {output.resolve()}/index.html')
 
@@ -207,6 +215,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', required=True, help='Chemin relatif au répertoire courant')
     parser.add_argument('--output', default='artifacts/omni_spot')
     parser.add_argument('--top', type=int, default=50, help='Fenêtres à reconstruire/exporter; 0 = toutes')
+    parser.add_argument('--stride', type=int, default=None,
+                        help='Pas en échantillons; défaut = longueur de fenêtre (sans recouvrement); 1 = ancien comportement')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--n-z', type=int, default=16)
     parser.add_argument('--q', type=float, default=.001)
