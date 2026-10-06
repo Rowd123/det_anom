@@ -5,7 +5,7 @@ from typing import Optional
 import numpy as np
 from torch import Tensor
 
-from spot import SPOT
+from .spot import SPOT
 
 
 def to_numpy_1d(values) -> np.ndarray:

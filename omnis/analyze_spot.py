@@ -1,4 +1,12 @@
 """Inference-only SPOT analysis and ranked physical window reconstructions."""
+
+# Support both python -m omnis.NAME and the historical direct script call.
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "omnis"
+
 from argparse import ArgumentParser
 import csv
 import heapq
@@ -9,9 +17,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spot import SPOT
-from utils import BatchSlidingWindow, get_data, phase_embedding_to_phasor
-from visualize_reconstruction import (
+from .spot import SPOT
+from .utils import BatchSlidingWindow, get_data, phase_embedding_to_phasor
+from .visualize_reconstruction import (
     load_config, load_trained_model, resolve_from_config,
     physical_reconstruction_indices,
 )
@@ -218,9 +226,9 @@ def main(args):
     print(f'{len(scores)} fenêtres, {alarms.sum()} anomalies. Résultats : {output.resolve()}/index.html')
 
 
-if __name__ == '__main__':
+def cli(argv=None):
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument('--config', default='omnis/config.yaml', help='Configuration exacte du modèle entraîné')
+    parser.add_argument('--config', default=str(Path(__file__).with_name('config.yaml')), help='Configuration exacte du modèle entraîné')
     parser.add_argument('--checkpoint', required=True, help='Chemin relatif au répertoire courant')
     parser.add_argument('--output', default='artifacts/omni_spot')
     parser.add_argument('--top', type=int, default=50, help='Fenêtres à reconstruire/exporter; 0 = toutes')
@@ -232,4 +240,8 @@ if __name__ == '__main__':
     parser.add_argument('--level', type=float, default=.98, help='Quantile initial en queue haute')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default=None)
-    main(parser.parse_args())
+    main(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    cli()

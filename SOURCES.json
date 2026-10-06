@@ -1,0 +1,20 @@
+{
+  "retrieved_at": "2026-10-06",
+  "isolation_forest": {
+    "repository": "https://github.com/Rowd123/spec_anom",
+    "branch": "feature/window-statistics",
+    "commit": "b95d4d9cf67fb9629fb0f054beadbcd97d52c6a4"
+  },
+  "rpad_detection": {
+    "repository": "https://github.com/Rowd123/PMU-simulator",
+    "branch": "feature/rpad-event-detection",
+    "commit": "5b7319ce8b1b0e7c880dc5d4f24fdae2ca83367d"
+  },
+  "omnis": {
+    "repository": "https://github.com/Rowd123/det_anom",
+    "branch": "main",
+    "commit": "9e2f4517f6d3db1564650edb5c26053d232a46b7",
+    "path": "omnis",
+    "tests": "tests"
+  }
+}

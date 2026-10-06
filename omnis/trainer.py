@@ -11,7 +11,7 @@ import pyro
 import torch
 from torch import Tensor, nn
 
-from utils import (
+from .utils import (
     FEATURE_REPRESENTATION_VERSION,
     BatchSlidingWindow,
     TrainMinMaxNormalizer,
@@ -34,7 +34,6 @@ class SigmaEpochStatistics:
         self,
         near_floor_threshold: float,
         feature_names=None,
-        normalizer=None,
         reservoir_size: int = 65536,
         batch_sample_size: int = 4096,
     ):
@@ -704,7 +703,7 @@ class Trainer:
 
         if best_model_state is not None:
             if checkpoint_path is not None and Path(checkpoint_path).is_file():
-                self.load_checkpoint(checkpoint_path, learning_rate=config.initial_lr)
+                self.load_checkpoint(checkpoint_path)
             else:
                 self._model.load_state_dict(best_model_state)
 

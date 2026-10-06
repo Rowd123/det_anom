@@ -5,13 +5,13 @@ from torch import Tensor, nn
 
 import pyro.distributions as dist
 
-from units import (
+from .units import (
     DistributionParameterNetwork,
     GaussianRandomWalk,
 )
-from units import RecurrentPosteriorInputNetwork, RNNNetwork, SoftplusStd
-from recurrent_distributions import RecurrentDistribution
-from vae import VAE
+from .units import RecurrentPosteriorInputNetwork, RNNNetwork, SoftplusStd
+from .recurrent_distributions import RecurrentDistribution
+from .vae import VAE
 
 
 make_normal = lambda loc, scale: dist.Normal(loc, scale)
