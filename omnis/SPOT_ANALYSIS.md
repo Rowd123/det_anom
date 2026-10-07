@@ -1,10 +1,10 @@
 # Analyse SPOT d'un checkpoint OmniAnomaly
 
-Depuis la racine du dépôt, utiliser la configuration correspondant **exactement**
+Depuis la racine `det_anom`, utiliser la configuration correspondant **exactement**
 au modèle entraîné (architecture, colonnes, exclusions, normalisation et découpage) :
 
 ```bash
-python omnis/analyze_spot.py \
+omni-spot \
   --config omnis/config.yaml \
   --checkpoint omnis/model/TON_MODELE.pt \
   --output artifacts/omni_spot \

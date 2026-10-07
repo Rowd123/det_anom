@@ -6,6 +6,14 @@ Exemples (depuis la racine du dépôt) :
     python omnis/visualize_reconstruction.py --backend plotly --split train
 """
 
+# Support both python -m omnis.NAME and the historical direct script call.
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "omnis"
+
+
 from argparse import ArgumentParser
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +22,8 @@ import numpy as np
 import torch
 import yaml
 
-from model import OmniAnomaly
-from utils import (
+from .model import OmniAnomaly
+from .utils import (
     FEATURE_REPRESENTATION_VERSION,
     build_normalizer,
     get_data,
@@ -263,8 +271,11 @@ def main(arguments):
     values, _, excludes = train if split == "train" else test
     if values is None:
         raise ValueError(f"La partie {split} est vide")
+    checkpoint_path = (Path(arguments.checkpoint).expanduser().resolve()
+                       if arguments.checkpoint is not None
+                       else resolve_from_config(checkpoint, config_path))
     model, normalizer, device = load_trained_model(
-        config, representation, resolve_from_config(checkpoint, config_path), device_name
+        config, representation, checkpoint_path, device_name
     )
     values = torch.as_tensor(values, dtype=torch.float32)
     indices, reconstructed_embedding = reconstruct_last_points(
@@ -316,9 +327,9 @@ def main(arguments):
     print(f"MSE globale physique : {np.nanmean(mse):.6g}")
 
 
-if __name__ == "__main__":
+def cli(argv=None):
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="omnis/visualize_config.yaml")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("visualize_config.yaml")))
     parser.add_argument("--checkpoint")
     parser.add_argument("--split", choices=("train", "test"))
     parser.add_argument("--start", type=int)
@@ -331,4 +342,8 @@ if __name__ == "__main__":
         choices=("matplotlib", "plotly"),
     )
     parser.add_argument("--output")
-    main(parser.parse_args())
+    main(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    cli()

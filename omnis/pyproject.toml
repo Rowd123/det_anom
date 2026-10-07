@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pmu-omnianomaly"
+version = "0.1.0"
+description = "OmniAnomaly for PMU data with configurable normalization and SPOT"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "pandas>=2.0", "scipy>=1.10", "torch>=2.5", "pyro-ppl>=1.9", "PyYAML>=6", "matplotlib>=3.7", "plotly>=5.18", "tqdm>=4.65"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+omni-run = "omnis.main:cli"
+omni-spot = "omnis.analyze_spot:cli"
+omni-reconstruct = "omnis.visualize_reconstruction:cli"
+
+[tool.setuptools]
+packages = ["omnis"]
+package-dir = {omnis = "."}
+
+[tool.setuptools.package-data]
+omnis = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".."]
+addopts = "-ra"

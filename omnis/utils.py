@@ -605,7 +605,7 @@ def notre_data_tri(
 ):
     df = pd.read_csv(data_file_path, sep=";")
 
-    df["DATE_MESURE"] = pd.to_datetime(df["DATE_MESURE"])
+    df["DATE_MESURE"] = pd.to_datetime(df["DATE_MESURE"], format="mixed", utc=True)
 
     df.set_index("DATE_MESURE", inplace=True)
 

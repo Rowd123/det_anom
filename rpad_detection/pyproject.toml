@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pmu-rpad-detection"
+version = "0.1.0"
+description = "Causal RPAD event detection from synchronized PMU angles"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "plotly>=5.18"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+rpad-detection = "pmu_simulator.cli:main"
+pmu-sim = "pmu_simulator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pmu_simulator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

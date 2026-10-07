@@ -1,3 +1,11 @@
+
+# Support both python -m omnis.NAME and the historical direct script call.
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "omnis"
+
 # main.py
 
 import hashlib
@@ -15,11 +23,11 @@ import numpy as np
 import torch
 import yaml
 
-from eval import bf_search, pot_eval
-from model import OmniAnomaly
-from prediction import Predictor
-from trainer import Trainer
-from utils import build_normalizer, get_data, save_z
+from .eval import bf_search, pot_eval
+from .model import OmniAnomaly
+from .prediction import Predictor
+from .trainer import Trainer
+from .utils import build_normalizer, get_data, save_z
 
 
 def _filename_token(value) -> str:
@@ -79,6 +87,11 @@ def load_config(path: str | Path) -> SimpleNamespace:
             "Le contenu du fichier YAML doit être un dictionnaire"
         )
 
+    # Dataset, checkpoint and output paths in YAML share one origin.
+    for key in ("data_dir", "save_dir", "result_dir", "restore_checkpoint"):
+        if values.get(key) is not None:
+            value = Path(values[key]).expanduser()
+            values[key] = str(value if value.is_absolute() else (path.resolve().parent / value).resolve())
     return SimpleNamespace(**values)
 
 
@@ -454,21 +467,30 @@ def main(config) -> None:
     pprint(metrics)
 
 
-if __name__ == "__main__":
+def cli(argv=None):
     parser = ArgumentParser()
 
     parser.add_argument(
         "--config",
         type=str,
-        default="config.yaml",
+        default=str(Path(__file__).with_name("config.yaml")),
         help="Chemin vers le fichier YAML",
     )
 
-    arguments = parser.parse_args()
+    parser.add_argument("--run-mode", choices=("scratch", "resume", "evaluate"),
+                        help="Surcharge run_mode du YAML")
+    parser.add_argument("--checkpoint", help="Checkpoint relatif au répertoire courant; pour resume/evaluate")
+    arguments = parser.parse_args(argv)
 
     config = load_config(
         arguments.config
     )
+    if arguments.run_mode is not None:
+        config.run_mode = arguments.run_mode
+    if arguments.checkpoint is not None:
+        if config.run_mode == "scratch":
+            parser.error("--checkpoint requires --run-mode resume or evaluate")
+        config.restore_checkpoint = str(Path(arguments.checkpoint).expanduser().resolve())
 
     print("GPU available: ", torch.cuda.is_available())
 
@@ -479,3 +501,7 @@ if __name__ == "__main__":
     np.random.seed(42)
 
     main(config)
+
+
+if __name__ == "__main__":
+    cli()
