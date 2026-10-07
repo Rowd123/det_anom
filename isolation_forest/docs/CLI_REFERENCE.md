@@ -196,3 +196,19 @@ options:
   --batch-size BATCH_SIZE
 ```
 
+## `python isolation_forest/rank_windows.py`
+
+```text
+usage: rank_windows.py [-h] [--top-n TOP_N] scores output
+
+Classer les fenêtres par score IF décroissant et exporter un CSV.
+
+positional arguments:
+  scores         Parquet produit par score-iforest, avec son manifeste.
+  output         CSV à écrire, par exemple artifacts/if/ranked_windows.csv.
+
+options:
+  -h, --help     show this help message and exit
+  --top-n TOP_N  Ne conserver que les N premiers rangs (défaut : toutes les
+                 fenêtres).
+```

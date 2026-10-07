@@ -76,6 +76,7 @@ par l'utilisateur ou les commandes ; ils ne font pas partie du code livré.
 | Appliquer une forêt existante | `spectral-anomaly score-iforest` |
 | Calibrer un seuil sur ses scores | `spectral-anomaly spot` |
 | Afficher les fenêtres détectées sur le signal | `spectral-anomaly plot-spot` |
+| Exporter les fenêtres par score IF décroissant | `python isolation_forest/rank_windows.py SCORES.parquet CLASSEMENT.csv` |
 | Classer les scores et voir les corrélations | `spectral-anomaly analyze-scores` |
 | Expliquer une forêt existante | `spectral-anomaly-shap` |
 | Détecter depuis deux angles PMU synchronisés | `rpad-detection detect-phase` |

@@ -95,6 +95,45 @@ ou recette d'extraction change le contrat. Reprendre les bonnes configurations a
 lieu de supprimer le contrôle de compatibilité. Le graphique doit utiliser le CSV
 du **même intervalle** que les décisions.
 
+## Classer les fenêtres par score IF
+
+Le fichier [rank_windows.py](rank_windows.py) lit les scores déjà calculés et
+écrit un classement **du score le plus élevé au plus faible**, sans réentraînement.
+Il utilise le Parquet produit par `score-iforest` et son
+`.parquet.manifest.json`, conservé à côté du fichier.
+
+Depuis la racine `det_anom`, après installation du paquet :
+
+```bash
+python isolation_forest/rank_windows.py artifacts/if/new_scores.parquet artifacts/if/ranked_windows.csv
+```
+
+Ouvrir **`artifacts/if/ranked_windows.csv`** pour consulter le classement. La
+colonne `rank` commence à 1. Toutes les colonnes d'origine restent présentes,
+notamment `score`, `source_id`, `channel_id`, `window_id`, `window_start` et
+`window_end`. Les identifiants et les dates restent associés à leur score.
+Les fenêtres de même score gardent leur ordre dans le fichier d'entrée.
+
+Pour ne conserver que les 20 premiers rangs :
+
+```bash
+python isolation_forest/rank_windows.py artifacts/if/new_scores.parquet artifacts/if/top_20_windows.csv --top-n 20
+```
+
+`--top-n` doit être strictement positif ; sans cette option, toutes les fenêtres
+sont exportées. S'il dépasse le nombre de fenêtres, toutes sont conservées.
+Un fichier de scores vide produit un CSV avec les en-têtes seulement.
+Le dossier de sortie est créé si nécessaire ; un CSV existant au même chemin est
+remplacé. Les scores d'entrée restent inchangés. Les identifiants en double,
+les scores non numériques/NaN/infinis et une convention de score incompatible
+provoquent une erreur explicite.
+
+Le score est **`-IsolationForest.score_samples`** : plus il est élevé, plus la
+fenêtre est atypique selon la forêt. Ce n'est pas une probabilité. Le rang est
+global sur le fichier fourni ; utiliser des scores issus du même modèle.
+Le CSV classe les références des fenêtres et leurs scores ; pour tracer le signal
+avec les décisions, voir `plot-spot` ci-dessus.
+
 ## Classement, corrélations et valeurs des caractéristiques
 
 ```bash
@@ -165,6 +204,7 @@ spectral-anomaly score-iforest artifacts/if_demo/splits/calibration.parquet arti
 spectral-anomaly score-iforest artifacts/if_demo/splits/evaluation.parquet artifacts/if_demo/model.pkl artifacts/if_demo/evaluation_scores.parquet
 spectral-anomaly spot artifacts/if_demo/calibration_scores.parquet artifacts/if_demo/evaluation_scores.parquet artifacts/if_demo/decisions.parquet artifacts/if_demo/spot.pkl --config artifacts/if_demo/spot.json
 spectral-anomaly plot-spot artifacts/if_demo/signal.csv artifacts/if_demo/decisions.parquet artifacts/if_demo/decisions.html --source-id DEMO --channel-id V1.MAG
+python isolation_forest/rank_windows.py artifacts/if_demo/evaluation_scores.parquet artifacts/if_demo/ranked_windows.csv
 spectral-anomaly analyze-scores artifacts/if_demo/features.parquet artifacts/if_demo/evaluation_scores.parquet artifacts/if_demo/analysis --model artifacts/if_demo/model.pkl
 ```
 

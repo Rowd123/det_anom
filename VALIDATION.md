@@ -91,3 +91,17 @@ vérifications courantes. Pour relancer la suite :
 python -m pip install -e "./isolation_forest[shap,test]" -e "./rpad_detection[test]" -e "./omnis[test]"
 python -m pytest
 ```
+
+## Ajout du classement IF autonome — 7 octobre 2026
+
+Le script `isolation_forest/rank_windows.py` a été exécuté sur les **400 fenêtres**
+de scores d'évaluation de la démonstration IF. Son CSV conserve les mêmes scores,
+identifiants et dates, dans le même ordre décroissant que le rapport d'analyse
+existant, avec un rang supplémentaire commençant à 1.
+
+L'option `--top-n 20` produit les 20 premières lignes du classement complet.
+Une entrée vide conserve les en-têtes ; un artefact de décisions SPOT est refusé
+avec une erreur explicite. Les empreintes du Parquet des scores et de son manifeste
+sont identiques avant et après l'exécution. L'aide `--help` a été vérifiée et ajoutée
+à la référence des commandes. Ces contrôles portent sur le nouveau script ; les
+98 tests ci-dessus décrivent la validation initiale du regroupement.
